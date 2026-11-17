@@ -198,6 +198,24 @@ class ActivityLoggingTests(ApiTestCase):
         self.assertEqual(actions.count("translation.text"), 1)
         self.assertEqual(actions.count("assistant.message"), 1)
 
+    def test_humanizer_rewrites_text_and_logs_authenticated_use(self):
+        _, token = self.create_account()
+        auth = {"Authorization": f"Bearer {token}"}
+        user_id = self.user_id_for(token)
+        source_text = "The original sentence is a little awkward."
+        with patch("app.routers.ai.ai_completion", return_value="The sentence now reads naturally.") as completion:
+            response = self.client.post(
+                "/api/ai/humanize",
+                headers=auth,
+                json={"text": source_text, "writing_style": "professional", "strength": 4},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"humanized_text": "The sentence now reads naturally."})
+        self.assertEqual(completion.call_args.args[0][1]["content"], source_text)
+        self.assertIn("professional wording", completion.call_args.args[0][0]["content"])
+        self.assertIn("strength 4 of 5", completion.call_args.args[0][0]["content"])
+        self.assertIn("assistant.humanize", self.activity_actions(user_id))
+
     def assert_stream_messages_persisted(self, user_id, expected):
         with SessionLocal() as session:
             count = (

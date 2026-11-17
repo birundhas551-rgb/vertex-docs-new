@@ -52,6 +52,10 @@ class TranslationIn(BaseModel):
     text:str=Field(min_length=1,max_length=20000)
     source_language:Literal["auto","en","ta","hi","ml","te","kn","ja","de","sa","bn","fr","es","tanglish"]="auto"
     target_language:Literal["en","ta","hi","ml","te","kn","ja","de","sa","bn","fr","es","tanglish"]
+class HumanizeIn(BaseModel):
+    text:str=Field(min_length=1,max_length=20000)
+    writing_style:Literal["simple","professional","conversational","academic"]="simple"
+    strength:int=Field(default=3,ge=1,le=5)
 class TemplateRenderIn(BaseModel):
     template:Literal["resume","cover-letter","business-letter","meeting-notes","project-proposal","invoice"]
     layout:Literal["modern","classic","compact"]="modern"

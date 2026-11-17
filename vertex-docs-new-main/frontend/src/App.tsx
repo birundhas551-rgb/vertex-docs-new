@@ -1,7 +1,7 @@
 import { PointerEvent as ReactPointerEvent, SyntheticEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlignCenter, AlignLeft, AlignRight, AlignJustify, ArrowLeftRight, Bell, Check, ChevronDown, CircleAlert, Combine,
-  Crop, Download, Eraser, FilePlus2, FileSearch, FileText, Highlighter, ImagePlus, Languages, LayoutDashboard, LogOut,
+  AlignCenter, AlignLeft, AlignRight, AlignJustify, ArrowLeftRight, Check, ChevronDown, CircleAlert, Combine,
+  Copy, Crop, Download, Eraser, FilePlus2, FileSearch, FileText, Highlighter, ImagePlus, Languages, LayoutDashboard, LogOut,
   Menu, Moon, Search, Send, Settings2, ShieldCheck, Sparkles, Bold, Italic, Underline, Strikethrough, List, ListOrdered, Indent, Outdent, RemoveFormatting,
   Sun, Trash2, UploadCloud, X, Scissors, RotateCw, LockKeyhole, Pencil, Pen, Redo2, Save, Undo2,
   Mic, Volume2, BookOpen, MessageCircle, ArrowDownToLine, RefreshCw, UserRound,
@@ -83,9 +83,12 @@ type PageName =
   | 'PDF Studio'
   | 'Convert'
   | 'Language Bridge'
+  | 'Humanizer'
   | 'AI Documents'
   | 'Templates'
   | 'Document History'
+  | 'Settings'
+  | 'About JM Vertex'
   | 'Admin Dashboard'
   | 'Account / Privacy'
   | 'Companion & Themes';
@@ -146,6 +149,35 @@ const speechLocales: Record<string, string> = {
   te: 'te-IN', kn: 'kn-IN', ja: 'ja-JP', de: 'de-DE', sa: 'sa-IN',
   bn: 'bn-IN', fr: 'fr-FR', es: 'es-ES',
 };
+
+function detectBridgeLanguage(text: string) {
+  const scriptRanges: Record<string, [number, number]> = {
+    ta: [0x0b80, 0x0bff],
+    hi: [0x0900, 0x097f],
+    bn: [0x0980, 0x09ff],
+    ml: [0x0d00, 0x0d7f],
+    te: [0x0c00, 0x0c7f],
+    kn: [0x0c80, 0x0cff],
+  };
+  const counts = Object.fromEntries(Object.keys(scriptRanges).map((code) => [code, 0])) as Record<string, number>;
+  let latinCount = 0;
+  for (const character of text) {
+    if (!character.match(/\p{L}/u)) continue;
+    const point = character.codePointAt(0) ?? 0;
+    const script = Object.entries(scriptRanges).find(([, [start, end]]) => point >= start && point <= end);
+    if (script) counts[script[0]] += 1;
+    else if (point <= 0x024f || (point >= 0x1e00 && point <= 0x1eff)) latinCount += 1;
+  }
+  const [indicCode, indicCount] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0] ?? ['ta', 0];
+  if (indicCount >= 3 && indicCount >= latinCount) return indicCode;
+  if (latinCount >= 3) return 'en';
+  return null;
+}
+
+function countWords(text: string) {
+  const trimmed = text.trim();
+  return trimmed ? trimmed.split(/\s+/u).length : 0;
+}
 
 const templateCatalog: { id: TemplateKind; name: string; category: string; description: string }[] = [
   { id: 'resume', name: 'Resume', category: 'Career', description: 'A clear, polished layout for your experience and skills.' },
@@ -228,10 +260,10 @@ const navItems = [
   { name: 'Language Bridge' as const, label: 'Language Bridge', icon: Languages },
   { name: 'Convert' as const, label: 'Convert', icon: ArrowLeftRight },
   { name: 'AI Documents' as const, label: 'AI Documents', icon: Sparkles },
+  { name: 'Humanizer' as const, label: 'Humanizer', icon: Pencil },
   { name: 'Templates' as const, label: 'Templates', icon: LayerIcon },
   { name: 'Document History' as const, label: 'Document History', icon: FileSearch },
-  { name: 'Account / Privacy' as const, label: 'Account / Privacy', icon: ShieldCheck },
-  { name: 'Companion & Themes' as const, label: 'Companion & Themes', icon: Settings2 },
+  { name: 'Settings' as const, label: 'Settings', icon: Settings2 },
 ];
 
 const pdfActions: { id: PdfAction; name: string; description: string; icon: typeof FileText }[] = [
@@ -556,11 +588,26 @@ export default function App() {
   const drawingPointer = useRef(false);
   const [translationText, setTranslationText] = useState('');
   const [translationSource, setTranslationSource] = useState('auto');
+  const [translationSourceLocked, setTranslationSourceLocked] = useState(false);
   const [translationTarget, setTranslationTarget] = useState('en');
   const [translationFile, setTranslationFile] = useState<File | null>(null);
+  const [translationExtractBusy, setTranslationExtractBusy] = useState(false);
+  const translationFileLoadId = useRef(0);
   const [translationResult, setTranslationResult] = useState('');
+  const [translationRevised, setTranslationRevised] = useState('');
   const [translationOutput, setTranslationOutput] = useState<ProcessedPdf | null>(null);
   const [translationSaveBusy, setTranslationSaveBusy] = useState(false);
+  const [humanizerInput, setHumanizerInput] = useState('');
+  const [humanizerOutput, setHumanizerOutput] = useState('');
+  const [humanizerBusy, setHumanizerBusy] = useState(false);
+  const [humanizerError, setHumanizerError] = useState('');
+  const [humanizerNotice, setHumanizerNotice] = useState('');
+  const [humanizerWritingStyle, setHumanizerWritingStyle] = useState<'simple' | 'professional' | 'conversational' | 'academic'>('simple');
+  const [humanizerStrength, setHumanizerStrength] = useState(3);
+  const [humanizerFile, setHumanizerFile] = useState<File | null>(null);
+  const [humanizerFileBusy, setHumanizerFileBusy] = useState(false);
+  const [humanizerDownloadFormat, setHumanizerDownloadFormat] = useState<'txt' | 'docx' | 'pdf'>('txt');
+  const humanizerFileRequestId = useRef(0);
 
   useEffect(() => {
     const editor = editorTextRef.current;
@@ -1484,56 +1531,230 @@ export default function App() {
     setAiCompanionLine('Your translated text file is downloaded and ready to use!');
   }
 
-  async function runTranslation() {
+  async function extractBridgeText(file: File) {
+    const requestId = ++translationFileLoadId.current;
     if (!token) {
-      setTranslationResult('Sign in to use translation.');
+      setTranslationMessage('Sign in to extract text from your document.');
+      return;
+    }
+    setTranslationExtractBusy(true);
+    setTranslationMessage('Extracting document text…');
+    try {
+      const body = new FormData();
+      body.append('file', file);
+      const response = await fetch(`${API}/api/ai/chat/attachment-text`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body,
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { text: string };
+      if (requestId !== translationFileLoadId.current) return;
+      setTranslationText(result.text);
+      setTranslationSource(detectBridgeLanguage(result.text) ?? 'auto');
+      setTranslationSourceLocked(false);
+      setTranslationMessage('Document text extracted. Choose a target language and translate.');
+    } catch (error) {
+      if (requestId !== translationFileLoadId.current) return;
+      setTranslationMessage(error instanceof Error ? error.message : 'Could not extract text from this document.');
+    } finally {
+      if (requestId === translationFileLoadId.current) setTranslationExtractBusy(false);
+    }
+  }
+
+  function downloadBridgeText(filename: string, text: string) {
+    if (!text.trim()) return;
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function runTranslation(textOverride?: string, sourceOverride?: string, targetOverride?: string, isRevision = false) {
+    const useFile = !isRevision && textOverride === undefined && Boolean(translationFile);
+    const sourceLanguage = sourceOverride ?? (translationSource === 'auto' ? detectBridgeLanguage(translationText) ?? 'auto' : translationSource);
+    const targetLanguage = targetOverride ?? translationTarget;
+    const text = textOverride ?? translationText.trim();
+    if (!token) {
+      setTranslationMessage('Sign in to use translation.');
       setPage('Account / Privacy');
       return;
     }
-    if (!translationFile && !translationText.trim()) {
-      setTranslationResult('Enter text or choose a PDF, DOCX, TXT, or Markdown file.');
+    if (!useFile && !text) {
+      setTranslationMessage('Enter text or choose a PDF, DOCX, TXT, or Markdown file.');
       return;
     }
     setTranslationBusy(true);
-    setTranslationResult('');
     setTranslationMessage('');
     setTranslationOutput(null);
     try {
-      const body = translationFile ? new FormData() : JSON.stringify({
-        text: translationText.trim(),
-        source_language: translationSource,
-        target_language: translationTarget,
+      const body = useFile ? new FormData() : JSON.stringify({
+        text,
+        source_language: sourceLanguage,
+        target_language: targetLanguage,
       });
-      if (translationFile && body instanceof FormData) {
+      if (useFile && body instanceof FormData && translationFile) {
         body.append('file', translationFile);
-        body.append('source_language', translationSource);
-        body.append('target_language', translationTarget);
+        body.append('source_language', sourceLanguage);
+        body.append('target_language', targetLanguage);
       }
-      const response = await fetch(`${API}/api/ai/${translationFile ? 'translate-file' : 'translate'}`, {
+      const response = await fetch(`${API}/api/ai/${useFile ? 'translate-file' : 'translate'}`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
-          ...(!translationFile ? { 'Content-Type': 'application/json' } : {}),
+          ...(!useFile ? { 'Content-Type': 'application/json' } : {}),
         },
         body,
       });
       if (!response.ok) throw new Error(await responseError(response));
-      const result = await response.json() as { translation: string };
-      setTranslationResult(result.translation);
-      if (translationFile) {
+      const result = await response.json() as { translation: string; original_text?: string; detected_source_language?: string | null };
+      if (isRevision) setTranslationRevised(result.translation);
+      else setTranslationResult(result.translation);
+      const detectedSource = result.detected_source_language ?? (result.original_text ? detectBridgeLanguage(result.original_text) : null);
+      if (!translationSourceLocked && detectedSource) setTranslationSource(detectedSource);
+      if (useFile && result.original_text) setTranslationText(result.original_text);
+      if (useFile && translationFile) {
         const baseName = translationFile.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9-_]+/g, '-').replace(/^-|-$/g, '') || 'document';
-        const targetCode = translationTarget.replace(/[^a-zA-Z0-9-]/g, '') || 'translated';
+        const targetCode = targetLanguage.replace(/[^a-zA-Z0-9-]/g, '') || 'translated';
         const file = new File([result.translation], `vertex-${baseName}-${targetCode}.txt`, { type: 'text/plain;charset=utf-8' });
         setTranslationOutput({ file, url: URL.createObjectURL(file) });
         setTranslationMessage('Translation is ready. Download it or save it to your workspace history.');
       }
-      const targetName = languages.find(([code]) => code === translationTarget)?.[1] ?? 'your chosen language';
+      const targetName = languages.find(([code]) => code === targetLanguage)?.[1] ?? 'your chosen language';
       encourageUser(`Your ${targetName} translation is ready. Take a look—you’re doing great!`);
     } catch (error) {
-      setTranslationResult(error instanceof Error ? error.message : 'Translation failed.');
+      setTranslationMessage(error instanceof Error ? error.message : 'Translation failed.');
     } finally {
       setTranslationBusy(false);
     }
+  }
+
+  async function loadHumanizerFile(file: File) {
+    const requestId = ++humanizerFileRequestId.current;
+    const extension = file.name.split('.').pop()?.toLowerCase();
+    if (!extension || !['pdf', 'docx', 'txt'].includes(extension)) {
+      setHumanizerFile(null);
+      setHumanizerFileBusy(false);
+      setHumanizerError('Choose a PDF, DOCX, or TXT file.');
+      return;
+    }
+    setHumanizerFile(file);
+    setHumanizerInput('');
+    setHumanizerOutput('');
+    setHumanizerError('');
+    setHumanizerNotice('');
+    if (!token) {
+      setHumanizerError('Sign in to extract text from your document.');
+      return;
+    }
+    setHumanizerFileBusy(true);
+    try {
+      const body = new FormData();
+      body.append('file', file);
+      const response = await fetch(`${API}/api/ai/chat/attachment-text`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body,
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { text: string };
+      if (requestId !== humanizerFileRequestId.current) return;
+      setHumanizerInput(result.text);
+      setHumanizerNotice('Document text extracted. Review it, then choose your writing style and humanize it.');
+    } catch (error) {
+      if (requestId !== humanizerFileRequestId.current) return;
+      setHumanizerError(error instanceof Error ? error.message : 'Could not extract text from this document.');
+    } finally {
+      if (requestId === humanizerFileRequestId.current) setHumanizerFileBusy(false);
+    }
+  }
+
+  async function runHumanizer() {
+    if (!token) {
+      setHumanizerError('Sign in to use Humanizer.');
+      return;
+    }
+    if (!humanizerInput.trim()) {
+      setHumanizerError('Enter the text you want to humanize.');
+      return;
+    }
+    setHumanizerBusy(true);
+    setHumanizerError('');
+    setHumanizerNotice('');
+    try {
+      const response = await fetch(`${API}/api/ai/humanize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          text: humanizerInput.trim(),
+          writing_style: humanizerWritingStyle,
+          strength: humanizerStrength,
+        }),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { humanized_text: string };
+      setHumanizerOutput(result.humanized_text);
+      setHumanizerNotice('Your rewritten text is ready. Review it before using it.');
+    } catch (error) {
+      setHumanizerError(error instanceof Error ? error.message : 'Could not rewrite the text.');
+    } finally {
+      setHumanizerBusy(false);
+    }
+  }
+
+  async function copyHumanizerOutput() {
+    if (!humanizerOutput.trim()) return;
+    try {
+      await navigator.clipboard.writeText(humanizerOutput);
+      setHumanizerError('');
+      setHumanizerNotice('Humanized text copied to clipboard.');
+    } catch (error) {
+      setHumanizerError(error instanceof Error ? `Could not copy text: ${error.message}` : 'Could not copy text to clipboard.');
+    }
+  }
+
+  async function downloadHumanizerOutput() {
+    if (!token) {
+      setHumanizerError('Sign in to download the humanized document.');
+      return;
+    }
+    if (!humanizerOutput.trim()) return;
+    setHumanizerError('');
+    setHumanizerNotice('');
+    try {
+      const response = await fetch(`${API}/api/pdf/editor-export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ content: humanizerOutput, output_format: humanizerDownloadFormat, page_size: 'A4' }),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `humanized-text.${humanizerDownloadFormat}`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setHumanizerNotice(`Downloaded humanized-text.${humanizerDownloadFormat}.`);
+    } catch (error) {
+      setHumanizerError(error instanceof Error ? error.message : 'Could not download the humanized document.');
+    }
+  }
+
+  function resetHumanizer() {
+    humanizerFileRequestId.current += 1;
+    setHumanizerFile(null);
+    setHumanizerInput('');
+    setHumanizerOutput('');
+    setHumanizerWritingStyle('simple');
+    setHumanizerStrength(3);
+    setHumanizerDownloadFormat('txt');
+    setHumanizerFileBusy(false);
+    setHumanizerError('');
+    setHumanizerNotice('');
   }
 
   function clearTranslationOutput() {
@@ -3766,38 +3987,84 @@ export default function App() {
       case 'Language Bridge':
         return (
           <>
-            <PageHeading eyebrow="LANGUAGE BRIDGE" title="Translate your way" subtitle="Write in any supported language or upload a document, then choose the language you want." />
-            <section className="panel translation-panel">
-              <div className="translation-language-row">
-                <label className="field-label">From
-                  <select value={translationSource} onChange={(event) => { setTranslationSource(event.target.value); setTranslationResult(''); setTranslationOutput(null); setTranslationMessage(''); }}>
-                    <option value="auto">Detect language</option>
-                    {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
-                  </select>
+            <PageHeading eyebrow="LANGUAGE BRIDGE" title="Language Bridge" subtitle="Translate, edit and compare Tamil and English documents." />
+            <div className="language-bridge-page">
+              <section className="panel language-bridge-upload-card">
+                <h3>Upload Document</h3>
+                <p>Upload your document to begin the translation process.</p>
+                <label className="language-bridge-dropzone">
+                  <UploadCloud size={22} />
+                  <span>{translationFile ? translationFile.name : 'Choose a document'}</span>
+                  <small>PDF, DOCX or TXT · Maximum 20 MB</small>
+                  <input type="file" accept={AI_READABLE_ACCEPT} onChange={(event) => { const file = event.target.files?.[0] ?? null; setTranslationFile(file); setTranslationSource('auto'); setTranslationSourceLocked(false); setTranslationText(''); setTranslationResult(''); setTranslationRevised(''); setTranslationOutput(null); setTranslationMessage(''); event.target.value = ''; if (file) void extractBridgeText(file); }} />
                 </label>
-                <ArrowLeftRight className="translation-arrow" size={18} />
-                <label className="field-label">To
-                  <select value={translationTarget} onChange={(event) => { setTranslationTarget(event.target.value); setTranslationResult(''); setTranslationOutput(null); setTranslationMessage(''); }}>
-                    {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
-                  </select>
-                </label>
+              </section>
+
+              <section className="panel language-bridge-settings">
+                <div className="language-bridge-setting-row">
+                  <label className="field-label">Source Language
+                    <select value={translationSource} onChange={(event) => { setTranslationSource(event.target.value); setTranslationSourceLocked(event.target.value !== 'auto'); setTranslationResult(''); setTranslationRevised(''); setTranslationOutput(null); setTranslationMessage(''); }}>
+                      <option value="auto">Detect language</option>
+                      {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+                    </select>
+                  </label>
+                  <div className="language-bridge-arrow-wrap" aria-hidden="true"><ArrowLeftRight size={18} /></div>
+                  <label className="field-label">Target Language
+                    <select value={translationTarget} onChange={(event) => { setTranslationTarget(event.target.value); setTranslationResult(''); setTranslationRevised(''); setTranslationOutput(null); setTranslationMessage(''); }}>
+                      {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+                    </select>
+                  </label>
+                </div>
+              </section>
+
+              <div className="language-bridge-output-row">
+                <article className="panel language-bridge-output-card">
+                  <div className="language-bridge-card-header">
+                    <h4>Original {languages.find(([code]) => code === translationSource)?.[1] ?? 'Text'}</h4>
+                    <button type="button" className="language-bridge-download-button" disabled={!translationText.trim()} onClick={() => downloadBridgeText('original-text.txt', translationText)}><Download size={14} /> Download</button>
+                  </div>
+                  <textarea className="language-bridge-editor" aria-label="Original text" value={translationText} onChange={(event) => { const text = event.target.value; translationFileLoadId.current += 1; setTranslationExtractBusy(false); setTranslationText(text); setTranslationFile(null); if (!translationSourceLocked) setTranslationSource(detectBridgeLanguage(text) ?? 'auto'); setTranslationResult(''); setTranslationRevised(''); setTranslationOutput(null); setTranslationMessage(''); }} maxLength={20000} placeholder={translationFile ? `Extracting text from ${translationFile.name}…` : 'Type or paste the original text here…'} />
+                </article>
+
+                <article className="panel language-bridge-output-card">
+                  <div className="language-bridge-card-header">
+                    <h4>{languages.find(([code]) => code === translationTarget)?.[1] ?? 'Translation'}</h4>
+                    <button type="button" className="language-bridge-download-button" disabled={!translationResult.trim()} onClick={() => downloadBridgeText('translated-text.txt', translationResult)}><Download size={14} /> Download</button>
+                  </div>
+                  <textarea className="language-bridge-editor" aria-label="Translated text" value={translationResult} onChange={(event) => { setTranslationResult(event.target.value); setTranslationRevised(''); setTranslationMessage(''); }} maxLength={20000} placeholder="Translation will appear here. You can edit it before translating it back." />
+                </article>
               </div>
-              <label className="field-label translation-input-label">Text to translate
-                <textarea value={translationText} onChange={(event) => { setTranslationText(event.target.value); setTranslationFile(null); setTranslationResult(''); setTranslationOutput(null); setTranslationMessage(''); }} maxLength={20000} placeholder="Type or paste text in any language…" />
-              </label>
-              <div className="translation-or">or upload a document</div>
-              <label className="file-drop translation-file">
-                <UploadCloud size={21} />
-                <b>{translationFile ? translationFile.name : 'Choose a PDF, DOCX, TXT, or Markdown file'}</b>
-                <small>We extract text and translate it. Max 20,000 characters.</small>
-                <input type="file" accept={AI_READABLE_ACCEPT} onChange={(event) => { setTranslationFile(event.target.files?.[0] ?? null); setTranslationText(''); setTranslationResult(''); setTranslationOutput(null); setTranslationMessage(''); event.target.value = ''; }} />
-              </label>
-              <div className="translation-actions">
-                <span>13 targets, including Tanglish</span>
-                <button className="primary" disabled={translationBusy} onClick={() => void runTranslation()}>{translationBusy ? (translationFile ? 'Translating file sections…' : 'Translating…') : 'Translate'}</button>
+
+              <div className="language-bridge-action-row">
+                <button type="button" className="language-bridge-primary-action" disabled={translationBusy || translationExtractBusy || (!translationText.trim() && !translationFile)} onClick={() => void runTranslation()}>
+                  {translationBusy ? 'Translating…' : `Translate to ${languages.find(([code]) => code === translationTarget)?.[1] ?? 'target language'}`} <ArrowLeftRight size={15} />
+                </button>
+                <button type="button" className="language-bridge-primary-action" disabled={translationBusy || !translationResult.trim() || (translationSource === 'auto' && !detectBridgeLanguage(translationText))} onClick={() => void runTranslation(translationResult, translationTarget, translationSource === 'auto' ? detectBridgeLanguage(translationText) ?? 'auto' : translationSource, true)}>
+                  Translate edited version back to {languages.find(([code]) => code === translationSource)?.[1] ?? 'source language'} <ArrowLeftRight size={15} />
+                </button>
               </div>
+
+              <section className="panel language-bridge-revised-card">
+                <div className="language-bridge-card-header">
+                  <h3>Revised {languages.find(([code]) => code === translationSource)?.[1] ?? 'Text'}</h3>
+                  <button type="button" className="language-bridge-download-button" disabled={!translationRevised.trim()} onClick={() => downloadBridgeText('revised-text.txt', translationRevised)}><Download size={14} /> Download</button>
+                </div>
+                <textarea className="language-bridge-editor language-bridge-revised-editor" aria-label="Revised translation" value={translationRevised} onChange={(event) => setTranslationRevised(event.target.value)} maxLength={20000} placeholder="The revised translation will appear here after you translate your edited version back." />
+                <div className="language-bridge-decision-row">
+                  <button type="button" className="language-bridge-accept-button" disabled={!translationRevised.trim()} onClick={() => { setTranslationText(translationRevised); setTranslationResult(''); setTranslationRevised(''); setTranslationMessage('Revised translation accepted as the original text.'); }}><Check size={14} /> Accept Changes</button>
+                  <button type="button" className="language-bridge-reject-button" disabled={!translationRevised.trim()} onClick={() => { setTranslationRevised(''); setTranslationMessage('Revised translation rejected.'); }}><X size={14} /> Reject Changes</button>
+                </div>
+              </section>
+
+              <div className="language-bridge-notice">
+                <span className="language-bridge-notice-icon"><CircleAlert size={18} /></span>
+                <div>
+                  <strong>Important Document Notice</strong>
+                  <p>For legal, financial and official documents, always verify the translated content before using it.</p>
+                </div>
+              </div>
+
               {translationBusy && translationFile && <p className="translation-progress" role="status">Reading and translating the document in shorter sections. You can stay on this page while it finishes.</p>}
-              {translationResult && <section className="translation-result"><b>{translationFile ? 'Translated document' : 'Translation'}</b><pre>{translationResult}</pre></section>}
               {translationOutput && <div className="translation-output-actions">
                 <button className="primary" onClick={downloadTranslationOutput}><Download size={15} /> Download translated file</button>
                 <button disabled={!token || translationSaveBusy} onClick={() => void saveTranslationOutput()}><Save size={15} /> {translationSaveBusy ? 'Saving…' : 'Save to Document History'}</button>
@@ -3805,12 +4072,140 @@ export default function App() {
               </div>}
               {translationMessage && <p className="operation-notice" role="status">{translationMessage}</p>}
               {!token && <p className="inline-hint">Sign in to translate your documents.</p>}
-            </section>
+            </div>
+          </>
+        );
+      case 'Humanizer':
+        return (
+          <>
+            <div className="humanizer-page">
+              <section className="humanizer-hero">
+                <span className="humanizer-hero-icon"><Sparkles size={26} /></span>
+                <div>
+                  <h1>AI Humanizer</h1>
+                  <p>Make your AI-generated or formal text sound natural and human-like.</p>
+                </div>
+                <span className="humanizer-support"><Check size={14} /> Supports Files &amp; Text</span>
+              </section>
+
+              <section className="humanizer-source-panel">
+                <label className={`humanizer-upload-zone ${humanizerFileBusy ? 'loading' : ''}`}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => { event.preventDefault(); const file = event.dataTransfer.files[0]; if (file) void loadHumanizerFile(file); }}>
+                  <UploadCloud size={48} />
+                  <span className="humanizer-upload-copy">
+                    <b>{humanizerFile?.name || 'Upload your document'}</b>
+                    <small>{humanizerFileBusy ? 'Extracting text…' : 'Drag and drop or browse files'}</small>
+                    <span className="humanizer-file-types"><i>PDF</i><i>DOCX</i><i>TXT</i></span>
+                  </span>
+                  <input type="file" accept=".pdf,.docx,.txt,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void loadHumanizerFile(file); }} />
+                </label>
+                <label className="humanizer-paste-area">Or paste your text
+                  <small>Alternative input</small>
+                  <textarea value={humanizerInput} onChange={(event) => { humanizerFileRequestId.current += 1; setHumanizerFileBusy(false); setHumanizerFile(null); setHumanizerInput(event.target.value); setHumanizerOutput(''); setHumanizerError(''); setHumanizerNotice(''); }} maxLength={20000} placeholder="Paste content here…" />
+                </label>
+              </section>
+
+              <section className="humanizer-options">
+                <div className="humanizer-style-select">
+                  <b><Sparkles size={16} /> Writing Style:</b>
+                  <div className="humanizer-style-buttons" role="group" aria-label="Writing style">
+                    {([
+                      ['simple', 'Simple', Sparkles],
+                      ['professional', 'Professional', ShieldCheck],
+                      ['conversational', 'Conversational', MessageCircle],
+                      ['academic', 'Academic', BookOpen],
+                    ] as const).map(([style, label, Icon]) => (
+                      <button type="button" className={humanizerWritingStyle === style ? 'active' : ''} aria-pressed={humanizerWritingStyle === style} key={style} onClick={() => setHumanizerWritingStyle(style)}>
+                        <Icon size={14} /> {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <label className="humanizer-strength">
+                  <b><Settings2 size={16} /> Humanization Strength:</b>
+                  <input type="range" min="1" max="5" step="1" value={humanizerStrength} aria-label="Humanization strength" onChange={(event) => setHumanizerStrength(Number(event.target.value))} />
+                  <span><small>Light Editing</small><small>Deep Rewriting</small></span>
+                </label>
+                <button className="humanizer-run-button" disabled={humanizerBusy || humanizerFileBusy || !humanizerInput.trim()} onClick={() => void runHumanizer()}>
+                  <Sparkles size={17} /> {humanizerBusy ? 'Humanizing…' : 'Humanize Document'}
+                </button>
+              </section>
+
+              <section className="humanizer-results">
+                <article className="humanizer-result-card">
+                  <header>
+                    <b><FileText size={17} /> Original Text</b>
+                    <span>Word Count: {countWords(humanizerInput)}</span>
+                  </header>
+                  <div className="humanizer-result-content">{humanizerInput || 'Your original text will appear here.'}</div>
+                </article>
+                <span className="humanizer-result-arrow" aria-hidden="true"><ArrowLeftRight size={25} /></span>
+                <article className="humanizer-result-card humanizer-result-success">
+                  <header>
+                    <b><Check size={17} /> Humanized Result</b>
+                    <span>Word Count: {countWords(humanizerOutput)}</span>
+                  </header>
+                  <div className="humanizer-result-content">{humanizerOutput || 'Your humanized text will appear here.'}</div>
+                </article>
+              </section>
+
+              <section className="humanizer-actions">
+                <div className="humanizer-action-buttons">
+                  <b>You can now:</b>
+                  <button type="button" disabled={!humanizerOutput.trim()} onClick={() => void copyHumanizerOutput()}><Copy size={16} /> Copy Text</button>
+                  <div className="humanizer-download-control">
+                    <Download size={16} />
+                    <select aria-label="Download format" value={humanizerDownloadFormat} disabled={!humanizerOutput.trim()} onChange={(event) => setHumanizerDownloadFormat(event.target.value as 'txt' | 'docx' | 'pdf')}>
+                      <option value="txt">Download as TXT</option>
+                      <option value="docx">Download as DOCX</option>
+                      <option value="pdf">Download as PDF</option>
+                    </select>
+                    <button type="button" disabled={!humanizerOutput.trim()} aria-label="Download humanized result" onClick={() => void downloadHumanizerOutput()}><ArrowDownToLine size={15} /></button>
+                  </div>
+                  <button type="button" disabled={humanizerBusy || humanizerFileBusy} onClick={resetHumanizer}><RefreshCw size={15} /> Start Over</button>
+                </div>
+                <p><CircleAlert size={16} /> Your meaning is preserved while making the text more natural and easy to read.</p>
+              </section>
+
+              {humanizerError && <p className="ai-error" role="alert">{humanizerError}</p>}
+              {humanizerNotice && <p className="operation-notice" role="status">{humanizerNotice}</p>}
+              {!token && <p className="inline-hint">Sign in to use Humanizer.</p>}
+            </div>
+          </>
+        );
+      case 'Settings':
+        return (
+          <>
+            <PageHeading eyebrow="SETTINGS" title="Settings" subtitle="Manage your account, workspace appearance, and information about JM Vertex." />
+            <div className="settings-options-grid">
+              <section className="panel settings-option-card">
+                <span className="settings-option-icon"><UserRound size={20} /></span>
+                <h2>Profile / Account settings</h2>
+                <p>Manage your profile, sign-in details, privacy, and account security.</p>
+                {user && <small>Signed in as {user.email}</small>}
+                <button onClick={() => setPage('Account / Privacy')}>Open account settings <ChevronDown size={15} /></button>
+              </section>
+              <section className="panel settings-option-card">
+                <span className="settings-option-icon"><Settings2 size={20} /></span>
+                <h2>Theme</h2>
+                <p>Choose your workspace colour palette, light or dark mode, and assistant companion.</p>
+                <small>Current theme: {palettes.find((item) => item.id === paletteId)?.name ?? paletteId} · {themeMode}</small>
+                <button onClick={() => setPage('Companion & Themes')}>Choose theme <ChevronDown size={15} /></button>
+              </section>
+              <section className="panel settings-option-card">
+                <span className="settings-option-icon"><FileText size={20} /></span>
+                <h2>About JM Vertex</h2>
+                <p>Learn about JM Vertex Technologies and the Vertex Docs workspace.</p>
+                <button onClick={() => setPage('About JM Vertex')}>About JM Vertex <ChevronDown size={15} /></button>
+              </section>
+            </div>
           </>
         );
       case 'Account / Privacy':
         return (
           <>
+            <button className="settings-back-button" onClick={() => setPage('Settings')}><ArrowLeftRight size={14} /> Settings</button>
             <PageHeading eyebrow="ACCOUNT & PRIVACY" title={user ? 'Account & security' : 'Sign in to your workspace'} subtitle={user ? 'Your identity, session and document privacy in one place.' : 'Create a personal account or sign in to return to your private workspace.'} />
             {user ? <div className="account-page-content">
               <section className="panel account-profile-card">
@@ -3851,6 +4246,7 @@ export default function App() {
       case 'Companion & Themes':
         return (
           <>
+            <button className="settings-back-button" onClick={() => setPage('Settings')}><ArrowLeftRight size={14} /> Settings</button>
             <PageHeading eyebrow="MAKE VERTEX YOURS" title="Companion & appearance" subtitle="Choose your animated companion and give your workspace a colour palette that feels right." />
             <div className="appearance-grid">
               <section className="panel companion-panel">
@@ -3888,18 +4284,124 @@ export default function App() {
             </div>
           </>
         );
+      case 'About JM Vertex':
+        return (
+          <>
+            <button className="settings-back-button" onClick={() => setPage('Settings')}><ArrowLeftRight size={14} /> Settings</button>
+            <div className="about-jm-page">
+              <section className="about-jm-hero">
+                <div className="about-jm-brand"><img src="/jm-logo.png" alt="JM Vertex Technologies logo" /></div>
+                <div className="about-jm-hero-copy">
+                  <span className="eyebrow">ABOUT THE COMPANY</span>
+                  <h1>JM Vertex Technologies</h1>
+                  <p className="about-jm-tagline">Learn. Build. Grow.</p>
+                  <p>Empowering students and businesses across India.</p>
+                  <a href="https://jmvertextechnologies.com/" target="_blank" rel="noreferrer">Visit jmvertextechnologies.com <ArrowDownToLine size={14} /></a>
+                </div>
+                <span className="about-jm-location"><FileSearch size={15} /> Pollachi, Tamil Nadu, India</span>
+              </section>
+
+              <section className="about-jm-section">
+                <div className="about-jm-section-heading"><span className="eyebrow">WHO WE ARE</span><h2>Bridging learning and industry</h2></div>
+                <div className="about-jm-overview-grid">
+                  <article className="panel about-jm-mission">
+                    <h3>Our mission</h3>
+                    <p>To bridge the gap between academic learning and industry demands through practical technology training, internships, custom website development, foreign language courses, and end-to-end project building.</p>
+                  </article>
+                  <article className="panel about-jm-founders">
+                    <h3>Our founders</h3>
+                    <div><b>Joshua J</b><span>Founder</span></div>
+                    <div><b>Madhav Adithya S</b><span>Co-Founder</span></div>
+                  </article>
+                </div>
+              </section>
+
+              <section className="about-jm-section">
+                <div className="about-jm-section-heading"><span className="eyebrow">WHAT WE DO</span><h2>Core services</h2><p>Practical programs and technology services designed around real-world outcomes.</p></div>
+                <div className="about-jm-services-grid">
+                  <article className="panel about-jm-service-card">
+                    <span className="about-jm-card-icon"><Sparkles size={19} /></span>
+                    <h3>Training &amp; Internships</h3>
+                    <p>Mentor-led, industry-focused programs lasting 4–8 weeks, with hands-on projects and verified certificates.</p>
+                    <ul>
+                      <li><b>Python:</b> Core Python, data structures, OOP, CLI apps, automation, and data analysis.</li>
+                      <li><b>Web Development:</b> HTML, CSS, JavaScript, React, portfolio sites, and e-commerce UIs.</li>
+                      <li><b>AI:</b> ML fundamentals, neural networks, predictive models, chatbots, and image classifiers.</li>
+                      <li><b>Cloud Computing:</b> AWS/GCP basics, serverless functions, hosting, and cloud databases.</li>
+                      <li><b>Cybersecurity:</b> Network security, ethical hacking, vulnerability scanners, and secure auth.</li>
+                    </ul>
+                    <div className="about-jm-course-links">
+                      <a href="https://jmvertextechnologies.com/python-training" target="_blank" rel="noreferrer">Python course</a>
+                      <a href="https://jmvertextechnologies.com/full-stack-training" target="_blank" rel="noreferrer">Web development</a>
+                      <a href="https://jmvertextechnologies.com/ai-training" target="_blank" rel="noreferrer">AI course</a>
+                      <a href="https://jmvertextechnologies.com/cloud-computing-training" target="_blank" rel="noreferrer">Cloud course</a>
+                      <a href="https://jmvertextechnologies.com/cybersecurity-training" target="_blank" rel="noreferrer">Cybersecurity</a>
+                    </div>
+                  </article>
+
+                  <article className="panel about-jm-service-card">
+                    <span className="about-jm-card-icon"><FileText size={19} /></span>
+                    <h3>Website Development</h3>
+                    <p>Fast, modern websites for small businesses, startups, and personal brands—from landing pages to full web applications.</p>
+                    <ol className="about-jm-process">
+                      <li>Consultation &amp; requirements</li><li>UI/UX design &amp; prototyping</li>
+                      <li>Frontend &amp; backend development</li><li>Testing &amp; quality assurance</li><li>Deployment &amp; domain setup</li>
+                    </ol>
+                    <div className="about-jm-featured-project">
+                      <b>Featured project</b>
+                      <p><a href="https://pizzacrave.in/" target="_blank" rel="noreferrer">Pizza Crave <ArrowDownToLine size={12} /></a> — restaurant website with a dynamic video hero carousel, interactive menu, and direct WhatsApp ordering.</p>
+                    </div>
+                  </article>
+
+                  <article className="panel about-jm-service-card">
+                    <span className="about-jm-card-icon"><Languages size={19} /></span>
+                    <h3>Foreign Language Training</h3>
+                    <p>Online and offline classes, flexible timings, beginner-to-advanced learning, and verified certificates.</p>
+                    <div className="about-jm-language-group">
+                      <h4>German</h4>
+                      <ul><li><b>A1 · 8 weeks:</b> Basic vocabulary, simple sentences, and everyday conversations.</li><li><b>A2 · 8 weeks:</b> Complex sentences, past/future tenses, and routine tasks.</li><li><b>B1 · 10 weeks:</b> Independent use, opinions, and preparation for study or work in Germany.</li></ul>
+                    </div>
+                    <div className="about-jm-language-group">
+                      <h4>Japanese</h4>
+                      <ul><li><b>Basic · 6 weeks:</b> Hiragana, Katakana, and basic conversation.</li><li><b>JLPT N5 · 10 weeks:</b> Basic grammar, around 100 Kanji, and daily communication.</li><li><b>JLPT N4 · 12 weeks:</b> Advanced vocabulary, complex grammar, and around 300 Kanji.</li></ul>
+                    </div>
+                  </article>
+
+                  <article className="panel about-jm-service-card">
+                    <span className="about-jm-card-icon"><Settings2 size={19} /></span>
+                    <h3>Custom Project Building</h3>
+                    <p>End-to-end support for first-year mini-projects, final-year capstones, and startup MVPs.</p>
+                    <h4>Project domains</h4>
+                    <ul><li>Full-stack web apps: React, Node.js, Python, and PHP.</li><li>AI/ML: Computer vision and natural language processing.</li><li>Mobile apps: React Native and Flutter.</li><li>Cloud infrastructure: AWS and GCP.</li></ul>
+                    <div className="about-jm-deliverables"><b>Deliverables</b><span>Source code</span><span>Project reports</span><span>Architecture design</span><span>Deployment</span><span>Documentation support</span></div>
+                  </article>
+                </div>
+              </section>
+
+              <section className="about-jm-contact">
+                <div><span className="eyebrow">GET IN TOUCH</span><h2>Contact JM Vertex Technologies</h2><p>Monday–Saturday, 9:00 AM–6:00 PM · Sunday closed</p></div>
+                <div className="about-jm-contact-links">
+                  <a href="mailto:jmvertextechnologies2025@gmail.com"><b>Email</b><span>jmvertextechnologies2025@gmail.com</span></a>
+                  <a href="tel:+919092737477"><b>Phone</b><span>+91 90927 37477</span></a>
+                  <a href="tel:+919345699376"><b>Phone</b><span>+91 93456 99376</span></a>
+                  <a href="https://jmvertextechnologies.com/" target="_blank" rel="noreferrer"><b>Website</b><span>jmvertextechnologies.com</span></a>
+                </div>
+              </section>
+            </div>
+          </>
+        );
     }
   }
+
+  const settingsPages: PageName[] = ['Settings', 'Account / Privacy', 'Companion & Themes', 'About JM Vertex'];
 
   return (
     <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
       <header className="topbar">
         <button className="icon-button menu-button" aria-label="Toggle navigation" onClick={() => setSidebarOpen((open) => !open)}><Menu size={19} /></button>
         <button className="brand" onClick={() => setPage('Home / Workspace')}><span className="brand-mark"><img src="/jm-logo.png" alt="JM logo" /></span><span><b>Vertex Docs</b><small>JM Vertex Technologies</small></span></button>
-        <div className="top-search"><Search size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') setPage('Convert'); }} placeholder="Search documents, tools or features..." /></div>
         <div className="top-actions">
           <button className="icon-button" aria-label="Appearance settings" onClick={() => setPage('Companion & Themes')}>{themeMode === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button>
-          <button className="icon-button notification-button" aria-label="Notifications" onClick={() => setNotice(token ? 'You are all caught up.' : 'Sign in to see account notifications.')}><Bell size={18} /></button>
           {user ? (
             <button className="profile-button" onClick={() => setPage('Account / Privacy')}><span>{user.name.slice(0, 1).toUpperCase()}</span><b>{user.name}</b><ChevronDown size={15} /></button>
           ) : <button className="profile-button" onClick={() => setPage('Account / Privacy')}><span><UserRound size={15} /></span><b>Sign in</b><ChevronDown size={15} /></button>}
@@ -3908,25 +4410,19 @@ export default function App() {
       <div className="app-body">
         <aside className="sidebar">
           <span className="sidebar-caption">WORKSPACE</span>
-          <nav>          {navItems.slice(0, 7).map(({ name: itemName, label, icon: Icon }) => (
-            <button className={page === itemName ? 'active' : ''} key={itemName} onClick={() => { setPage(itemName); if (itemName === 'AI Documents') setChatOpen(false); }}><Icon size={18} /><span>{label}</span></button>
+          <nav>          {navItems.slice(0, 8).map(({ name: itemName, label, icon: Icon }) => (
+            <button className={page === itemName || (itemName === 'Settings' && settingsPages.includes(page)) ? 'active' : ''} key={itemName} onClick={() => { setPage(itemName); if (itemName === 'AI Documents') setChatOpen(false); }}><Icon size={18} /><span>{label}</span></button>
           ))}</nav>
           {token && adminAccess === 'allowed' && <nav className="admin-sidebar-nav" aria-label="Administration">
             <button className={page === 'Admin Dashboard' ? 'active' : ''} onClick={() => setPage('Admin Dashboard')}><ShieldCheck size={18} /><span>Admin Dashboard</span></button>
           </nav>}
-          {page !== 'AI Documents' && <section className="sidebar-assistant">
-            <span className="sidebar-companion">{companion.emoji}</span>
-            <b>Need a hand?</b>
-            <small>Ask the Vertex assistant</small>
-            <button onClick={() => setChatOpen(true)}>Open assistant</button>
-          </section>}
-          <nav className="sidebar-bottom">{navItems.slice(7).map(({ name: itemName, label, icon: Icon }) => (
+          <nav className="sidebar-bottom">{navItems.slice(8).map(({ name: itemName, label, icon: Icon }) => (
             <button className={page === itemName ? 'active' : ''} key={itemName} onClick={() => setPage(itemName)}><Icon size={18} /><span>{label}</span></button>
           ))}</nav>
         </aside>
         <main className="main-content">
           {renderPage()}
-          {notice && !['Account / Privacy', 'Companion & Themes'].includes(page) && <Notice message={notice} onClose={() => setNotice('')} />}
+          {notice && !settingsPages.includes(page) && <Notice message={notice} onClose={() => setNotice('')} />}
         </main>
       </div>
       {page !== 'AI Documents' && assistantToast && (

@@ -34,7 +34,7 @@ from ..activity import record_activity
 from ..extractive_summary import summarize
 from ..models import AssistantConversation, AssistantMessage, Document
 from ..ocr import image_text_with_ocr, pdf_text_with_ocr
-from ..schemas import ChatIn, DocumentChatIn, DocumentLanguageIn, DocumentTranslationIn, TranslationIn
+from ..schemas import ChatIn, DocumentChatIn, DocumentLanguageIn, DocumentTranslationIn, HumanizeIn, TranslationIn
 from ..security import current_user
 from ..storage_service import read_document
 from ..chatbot.attachments import (
@@ -972,6 +972,38 @@ async def translate(x: TranslationIn, u = Depends(current_user)):
     return result
 
 
+@router.post("/humanize")
+async def humanize(x: HumanizeIn, u = Depends(current_user)):
+    style_guidance = {
+        "simple": "Use clear, simple words and straightforward sentences.",
+        "professional": "Use polished, professional wording appropriate for work.",
+        "conversational": "Use a friendly, natural, conversational tone.",
+        "academic": "Use precise, formal academic wording.",
+    }
+    strength_guidance = (
+        "Make only light edits for grammar and flow."
+        if x.strength == 1
+        else "Rewrite substantially while preserving the original meaning."
+        if x.strength == 5
+        else f"Use a moderate level of rewriting (strength {x.strength} of 5)."
+    )
+    rewritten = await ai_completion([
+        {
+            "role": "system",
+            "content": (
+                "Rewrite the user's text while preserving its original meaning, facts, intent, and language. "
+                f"{style_guidance[x.writing_style]} {strength_guidance} "
+                "Do not invent details or add commentary. Return only the rewritten text."
+            ),
+        },
+        {"role": "user", "content": x.text},
+    ])
+    if not rewritten.strip():
+        raise HTTPException(502, "The AI provider returned an empty rewrite.")
+    record_activity(u.id, "assistant.humanize", "assistant")
+    return {"humanized_text": rewritten.strip()}
+
+
 @router.post("/translate-file")
 async def translate_file(
     file: UploadFile = File(...),
@@ -991,5 +1023,7 @@ async def translate_file(
         "source_language": source_language, "target_language": target_language,
         "file_size_bytes": len(content), "file_extension": Path(file.filename or "").suffix.lstrip("."),
     })
+    result["original_text"] = text
+    result["detected_source_language"] = detect_document_language(text)
     return result
 

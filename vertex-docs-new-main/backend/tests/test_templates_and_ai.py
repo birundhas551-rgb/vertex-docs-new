@@ -79,6 +79,8 @@ class TemplatesAndAiTests(ApiTestCase):
             response.json()["translation"],
             "\n\n".join(f"Translated Section {index}" for index in range(5)),
         )
+        self.assertEqual(response.json()["original_text"], text.strip())
+        self.assertEqual(response.json()["detected_source_language"], "en")
 
     def test_ai_question_generator_uses_document_text_and_validates_count(self):
         _,token=self.create_account()

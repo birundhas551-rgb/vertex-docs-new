@@ -20,7 +20,7 @@ _ALLOWED_ACTIONS = {
     "pdf.text_extract", "pdf.compress", "pdf.preview", "pdf.annotate",
     "pdf.editor_export", "pdf.convert", "pdf.scan", "pdf.tool",
     "translation.text", "translation.file", "translation.document",
-    "assistant.message", "assistant.conversion", "assistant.summarize",
+    "assistant.message", "assistant.conversion", "assistant.summarize", "assistant.humanize",
     "assistant.document_chat", "assistant.question_generation",
     "assistant.document_conversion",
 }
