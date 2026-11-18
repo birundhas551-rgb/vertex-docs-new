@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ElementTree
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -20,8 +21,10 @@ from pptx import Presentation as PowerPointPresentation
 from pptx.util import Inches as PowerPointInches
 from pypdf import PdfReader, PdfWriter
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 
@@ -36,6 +39,106 @@ SUPPORTED_SOURCE_EXTENSIONS = {
     "odt", "ods", "odp", "pages", "csv", "epub", "pdf",
 }
 SUPPORTED_OUTPUT_FORMATS = {"pdf", "pdfa", "jpg", "png", "docx", "pptx", "xlsx", "txt", "md"}
+FONT_DIRECTORY = Path(__file__).resolve().parent / "assets" / "fonts"
+# Scripts that need a Unicode font with the right glyph coverage. LibreOffice
+# performs the complex-script shaping and embeds the resulting font in the PDF.
+UNICODE_SCRIPT_RANGES = {
+    "tamil": (0x0B80, 0x0BFF),
+    "devanagari": (0x0900, 0x097F),
+    "bengali": (0x0980, 0x09FF),
+    "malayalam": (0x0D00, 0x0D7F),
+    "telugu": (0x0C00, 0x0C7F),
+    "kannada": (0x0C80, 0x0CFF),
+}
+BUNDLED_FONTS = {
+    "tamil": ("NotoSansTamil", FONT_DIRECTORY / "NotoSansTamil-Regular.ttf"),
+    "devanagari": ("NotoSansDevanagari", FONT_DIRECTORY / "NotoSansDevanagari-Regular.ttf"),
+}
+
+
+def _decode_text(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
+def _dominant_script(text: str) -> str | None:
+    counts = {script: 0 for script in UNICODE_SCRIPT_RANGES}
+    for character in text:
+        point = ord(character)
+        for script, (start, end) in UNICODE_SCRIPT_RANGES.items():
+            if start <= point <= end:
+                counts[script] += 1
+                break
+    script, count = max(counts.items(), key=lambda item: item[1])
+    return script if count else None
+
+
+@lru_cache(maxsize=None)
+def _reportlab_font(script: str | None) -> str | None:
+    if not script or script not in BUNDLED_FONTS:
+        return None
+    name, path = BUNDLED_FONTS[script]
+    if not path.is_file():
+        return None
+    try:
+        pdfmetrics.registerFont(TTFont(name, str(path)))
+    except Exception:
+        logger.warning("Could not register the bundled %s PDF font", script)
+        return None
+    return name
+
+
+def _fallback_text_to_pdf(text: str) -> bytes:
+    """Render text without LibreOffice, embedding a Unicode font where possible.
+
+    ReportLab does not apply complex-script shaping, so LibreOffice is preferred
+    for Tamil, Devanagari and other Indic scripts. This path only runs when the
+    conversion engine is unavailable.
+    """
+    output = io.BytesIO()
+    document = SimpleDocTemplate(
+        output,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+    )
+    body = getSampleStyleSheet()["BodyText"]
+    story = []
+    for block in text.split("\n\n"):
+        font = _reportlab_font(_dominant_script(block))
+        style = ParagraphStyle("UnicodeBody", parent=body, fontName=font or "Helvetica")
+        for line in block.splitlines():
+            if line.strip():
+                story.append(Paragraph(escape(line), style))
+                story.append(Spacer(1, 3))
+        story.append(Spacer(1, 8))
+    try:
+        document.build(story)
+    except UnicodeEncodeError as error:
+        raise HTTPException(
+            400,
+            "This text contains characters the PDF font cannot render. Install LibreOffice "
+            "or a Unicode font that covers the document's script.",
+        ) from error
+    return output.getvalue()
+
+
+def _text_to_pdf(text: str) -> bytes:
+    if not text.strip():
+        raise HTTPException(400, "The document contains no readable text.")
+    encoded = b"\xef\xbb\xbf" + text.encode("utf-8")
+    try:
+        return _libreoffice_convert(encoded, "txt", "pdf", "pdf")
+    except HTTPException as error:
+        if error.status_code != 503:
+            raise
+        return _fallback_text_to_pdf(text)
 
 
 def _libreoffice_executable() -> str:
@@ -256,7 +359,13 @@ class _HtmlText(HTMLParser):
             self.parts.append(text)
 
 
-def _epub_to_pdf(data: bytes) -> bytes:
+def _html_text(data: bytes) -> str:
+    parser = _HtmlText()
+    parser.feed(_decode_text(data))
+    return " ".join(parser.parts)
+
+
+def _epub_text(data: bytes) -> str:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = set(archive.namelist())
@@ -293,17 +402,11 @@ def _epub_to_pdf(data: bytes) -> bytes:
     text = "\n\n".join(part for part in documents if part.strip())
     if not text:
         raise HTTPException(400, "The EPUB contains no readable text.")
-    output = io.BytesIO()
-    pdf = SimpleDocTemplate(output, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm, topMargin=18 * mm, bottomMargin=18 * mm)
-    styles = getSampleStyleSheet()
-    story = [Paragraph(escape(line), styles["BodyText"]) for line in text.splitlines() if line.strip()]
-    for _ in range(max(0, len(story) - 1)):
-        story.insert(1, Spacer(1, 5))
-    try:
-        pdf.build(story)
-    except UnicodeEncodeError as error:
-        raise HTTPException(400, "The EPUB text contains characters this PDF font cannot render.") from error
-    return output.getvalue()
+    return text
+
+
+def _epub_to_pdf(data: bytes) -> bytes:
+    return _text_to_pdf(_epub_text(data))
 
 
 def _pages_preview(data: bytes) -> bytes | None:
@@ -320,6 +423,8 @@ def _pages_preview(data: bytes) -> bytes | None:
 def _convert_to_pdf(data: bytes, extension: str) -> bytes:
     if extension in {"jpg", "jpeg", "png", "webp"}:
         return _image_to_pdf(data)
+    if extension in {"txt", "md"}:
+        return _text_to_pdf(_decode_text(data))
     if extension == "epub":
         return _epub_to_pdf(data)
     if extension == "zip":

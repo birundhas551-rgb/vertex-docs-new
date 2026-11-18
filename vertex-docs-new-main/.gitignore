@@ -8,10 +8,6 @@ venv/
 __pycache__/
 *.pyc
 
-# Environment secrets
-.env
-.env.*
-!.env.example
 
 # Local databases
 *.db
@@ -29,6 +25,7 @@ backend/storage/*
 frontend/.tsupgrader/
 
 # Backup files
+backups/
 
 # Local backup files
 frontend/src/App.backup.txt

@@ -1,4 +1,3 @@
-
 import os
 from dotenv import load_dotenv
 
@@ -9,25 +8,37 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .database import Base, engine
 from . import models
-from .routers import auth, settings, documents, pdf, ai, templates
+from .routers import auth, settings, documents, pdf, ai, templates, admin
+from .chatbot.routes import router as chatbot_router
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
 
+# Create legacy/application tables as before, but let Alembic own the new
+# activity log table so startup cannot silently modify an existing database.
+Base.metadata.create_all(
+    bind=engine,
+    tables=[table for table in Base.metadata.sorted_tables if table.name != "activity_logs"],
+)
+
+
+# Initialize FastAPI
 app = FastAPI(
     title="Vertex Docs API",
     version="1.0.0"
 )
 
+
 # Allow frontend development origins
 allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
     "http://localhost:5175",
     "http://127.0.0.1:5175",
 ]
 
-# Include any additional origins configured in .env
+
+# Include additional origins configured in .env
 env_origins = os.getenv("CORS_ORIGINS", "")
 
 if env_origins:
@@ -37,6 +48,8 @@ if env_origins:
         if origin.strip()
     )
 
+
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(set(allowed_origins)),
@@ -45,14 +58,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # Register API routers
 for router in (
     auth.router,
     settings.router,
-    documents.router,
+    documents.router,  
     pdf.router,
     ai.router,
-    templates.router
+    templates.router,
+    admin.router,
+    chatbot_router,
 ):
     app.include_router(router)
 
@@ -63,3 +79,4 @@ def health():
         "status": "ok",
         "service": "Vertex Docs API"
     }
+    

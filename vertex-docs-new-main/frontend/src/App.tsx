@@ -1,14 +1,24 @@
-import { PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { PointerEvent as ReactPointerEvent, SyntheticEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlignCenter, AlignLeft, AlignRight, ArrowLeftRight, Bell, Check, ChevronDown, CircleAlert, Combine,
-  Crop, Download, Eraser, FilePlus2, FileSearch, FileText, Highlighter, ImagePlus, Languages, LayoutDashboard, LogOut,
-  Menu, Moon, Search, Send, Settings2, ShieldCheck, Sparkles,
+  AlignCenter, AlignLeft, AlignRight, AlignJustify, ArrowLeftRight, Check, ChevronDown, CircleAlert, Combine,
+  Copy, Crop, Download, Eraser, FilePlus2, FileSearch, FileText, Highlighter, ImagePlus, Languages, LayoutDashboard, LogOut,
+  Menu, Moon, Search, Send, Settings2, ShieldCheck, Sparkles, Bold, Italic, Underline, Strikethrough, List, ListOrdered, Indent, Outdent, RemoveFormatting,
   Sun, Trash2, UploadCloud, X, Scissors, RotateCw, LockKeyhole, Pencil, Pen, Redo2, Save, Undo2,
   Mic, Volume2, BookOpen, MessageCircle, ArrowDownToLine, RefreshCw, UserRound,
+  Users,
 } from 'lucide-react';
 import { companions, conversionTools, groups, languages, palettes, tools, type ConversionTool } from './catalogue';
+import { VertexAssistant } from './features/assistant/VertexAssistant';
+import { AiDocChat } from './features/ai-intelligence/AiDocChat';
+import { supabase } from './lib/supabase';
+import './sidebar-hover.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const AI_READABLE_EXTENSIONS = [
+  'pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'html', 'htm', 'txt', 'md', 'rtf',
+  'hwp', 'zip', 'odt', 'ods', 'odp', 'pages', 'csv', 'epub', 'jpg', 'jpeg', 'png', 'webp',
+];
+const AI_READABLE_ACCEPT = [...AI_READABLE_EXTENSIONS.map((extension) => `.${extension}`), 'application/pdf', 'image/png', 'image/jpeg', 'image/webp'].join(',');
 
 type PaletteId = (typeof palettes)[number]['id'];
 type ThemeName = `${PaletteId}-${'light' | 'dark'}`;
@@ -16,6 +26,8 @@ type TemplateAccent = 'forest' | 'rose' | 'graphite' | 'cocoa' | 'amber' | 'ocea
 type EditorTool = 'text' | 'highlight' | 'pen' | 'pencil' | 'eraser';
 type ExportFormat = 'pdf' | 'docx' | 'txt';
 type ImagePosition = { x: number; y: number };
+type ImageSize = { width: number; height: number };
+type ImageResizeSession = { handle: string; startX: number; startY: number; left: number; top: number; width: number; height: number; aspect: number; pageWidth: number; pageHeight: number };
 type User = {
   id: number;
   name: string;
@@ -28,17 +40,56 @@ type DocumentItem = { id: number; name: string; size: number };
 type RecentUpload = { document: DocumentItem; file: File };
 type ProcessedPdf = { file: File; url: string };
 type EditorSnapshot = { text: string; drawing: string; hasDrawing: boolean };
+
+function editorPlainText(html: string) {
+  const node = document.createElement('div');
+  node.innerHTML = html;
+  return node.innerText || node.textContent || '';
+}
+
+async function drawRichText(context: CanvasRenderingContext2D, html: string, width: number, height: number) {
+  if (!editorPlainText(html).trim()) return;
+  const safeHtml = html.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<iframe[\s\S]*?<\/iframe>/gi, '');
+  const markup = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><foreignObject width="100%" height="100%"><div xmlns="http://www.w3.org/1999/xhtml" style="box-sizing:border-box;width:${width}px;height:${height}px;padding:${height * .09}px ${width * .09}px;color:#262b28;background:transparent;font:14px/1.65 'Segoe UI',Arial,sans-serif;overflow:hidden">${safeHtml}</div></foreignObject></svg>`;
+  const image = new Image();
+  image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(markup)}`;
+  await new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(new Error('Formatted text could not be rendered.')); });
+  context.drawImage(image, 0, 0, width, height);
+}
 type ScanPage = { id: string; file: File; preview: string; rotation: number };
 type ChatMessage = { role: 'user' | 'assistant'; text: string };
 type ChatConversation = { id: number; title: string; updated_at: string };
+type AdminStats = {
+  total_users: number;
+  total_documents: number;
+  total_pdf_operations: number;
+  total_translations: number;
+  total_ai_usage: number;
+  historical_activity_limited: boolean;
+  historical_activity_note: string;
+};
+type AdminActivity = {
+  id: number;
+  user_id: number;
+  user_email?: string;
+  action: string;
+  entity_type: string;
+  created_at: string;
+};
+type AdminUser = { id: number; email: string };
+type AdminPage<T> = { items: T[]; limit: number; offset: number; total: number; user_id?: number };
 type PageName =
   | 'Home / Workspace'
   | 'PDF Studio'
   | 'Convert'
   | 'Language Bridge'
+  | 'Humanizer'
   | 'AI Documents'
   | 'Templates'
   | 'Document History'
+  | 'Settings'
+  | 'About JM Vertex'
+  | 'Admin Dashboard'
   | 'Account / Privacy'
   | 'Companion & Themes';
 type PdfAction =
@@ -98,6 +149,35 @@ const speechLocales: Record<string, string> = {
   te: 'te-IN', kn: 'kn-IN', ja: 'ja-JP', de: 'de-DE', sa: 'sa-IN',
   bn: 'bn-IN', fr: 'fr-FR', es: 'es-ES',
 };
+
+function detectBridgeLanguage(text: string) {
+  const scriptRanges: Record<string, [number, number]> = {
+    ta: [0x0b80, 0x0bff],
+    hi: [0x0900, 0x097f],
+    bn: [0x0980, 0x09ff],
+    ml: [0x0d00, 0x0d7f],
+    te: [0x0c00, 0x0c7f],
+    kn: [0x0c80, 0x0cff],
+  };
+  const counts = Object.fromEntries(Object.keys(scriptRanges).map((code) => [code, 0])) as Record<string, number>;
+  let latinCount = 0;
+  for (const character of text) {
+    if (!character.match(/\p{L}/u)) continue;
+    const point = character.codePointAt(0) ?? 0;
+    const script = Object.entries(scriptRanges).find(([, [start, end]]) => point >= start && point <= end);
+    if (script) counts[script[0]] += 1;
+    else if (point <= 0x024f || (point >= 0x1e00 && point <= 0x1eff)) latinCount += 1;
+  }
+  const [indicCode, indicCount] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0] ?? ['ta', 0];
+  if (indicCount >= 3 && indicCount >= latinCount) return indicCode;
+  if (latinCount >= 3) return 'en';
+  return null;
+}
+
+function countWords(text: string) {
+  const trimmed = text.trim();
+  return trimmed ? trimmed.split(/\s+/u).length : 0;
+}
 
 const templateCatalog: { id: TemplateKind; name: string; category: string; description: string }[] = [
   { id: 'resume', name: 'Resume', category: 'Career', description: 'A clear, polished layout for your experience and skills.' },
@@ -180,10 +260,10 @@ const navItems = [
   { name: 'Language Bridge' as const, label: 'Language Bridge', icon: Languages },
   { name: 'Convert' as const, label: 'Convert', icon: ArrowLeftRight },
   { name: 'AI Documents' as const, label: 'AI Documents', icon: Sparkles },
+  { name: 'Humanizer' as const, label: 'Humanizer', icon: Pencil },
   { name: 'Templates' as const, label: 'Templates', icon: LayerIcon },
   { name: 'Document History' as const, label: 'Document History', icon: FileSearch },
-  { name: 'Account / Privacy' as const, label: 'Account / Privacy', icon: ShieldCheck },
-  { name: 'Companion & Themes' as const, label: 'Companion & Themes', icon: Settings2 },
+  { name: 'Settings' as const, label: 'Settings', icon: Settings2 },
 ];
 
 const pdfActions: { id: PdfAction; name: string; description: string; icon: typeof FileText }[] = [
@@ -273,6 +353,21 @@ function formatSize(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatAdminTimestamp(value: string) {
+  const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
+  const date = new Date(hasTimezone ? value : `${value}Z`);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).format(date);
+}
+
 function readImageData(file: File) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -356,7 +451,21 @@ export default function App() {
   const [avatar, setAvatar] = useState(() => companionFrom(localStorage.getItem('vd-avatar')).id);
   const [language, setLanguage] = useState(localStorage.getItem('vd-language') || 'en');
   const [token, setToken] = useState(localStorage.getItem('vd-token') || '');
+  const [authResolving, setAuthResolving] = useState(false);
   const [user, setUser] = useState<User | null>(null);
+  const [adminAccess, setAdminAccess] = useState<'checking' | 'allowed' | 'denied' | 'unavailable' | 'signed-out'>('checking');
+  const [adminStats, setAdminStats] = useState<AdminStats | null>(null);
+  const [adminActivityPage, setAdminActivityPage] = useState<AdminPage<AdminActivity> | null>(null);
+  const [adminUsersPage, setAdminUsersPage] = useState<AdminPage<AdminUser> | null>(null);
+  const [selectedAdminUser, setSelectedAdminUser] = useState<AdminUser | null>(null);
+  const [adminUserActivityPage, setAdminUserActivityPage] = useState<AdminPage<AdminActivity> | null>(null);
+  const [adminActivityOffset, setAdminActivityOffset] = useState(0);
+  const [adminUsersOffset, setAdminUsersOffset] = useState(0);
+  const [adminUserActivityOffset, setAdminUserActivityOffset] = useState(0);
+  const [adminRefreshVersion, setAdminRefreshVersion] = useState(0);
+  const [adminStatsError, setAdminStatsError] = useState('');
+  const [adminDataError, setAdminDataError] = useState('');
+  const [adminDataBusy, setAdminDataBusy] = useState(false);
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -398,7 +507,7 @@ export default function App() {
   const [chatAttachment, setChatAttachment] = useState<File | null>(null);
   const [chatAttachmentError, setChatAttachmentError] = useState('');
   const [chatConversionOutput, setChatConversionOutput] = useState<ProcessedPdf | null>(null);
-  const [chatConversionFormat, setChatConversionFormat] = useState<ExportFormat>('pdf');
+  const [chatConversionName, setChatConversionName] = useState<string>(conversionTools[0].name);
   const [chatConversionBusy, setChatConversionBusy] = useState(false);
   const chatAttachmentInputRef = useRef<HTMLInputElement | null>(null);
   const [aiDocMode, setAiDocMode] = useState<'summary' | 'chat' | 'translate'>('summary');
@@ -445,6 +554,7 @@ export default function App() {
   const [editorImageName, setEditorImageName] = useState('');
   const [editorImageSelected, setEditorImageSelected] = useState(false);
   const [editorImagePosition, setEditorImagePosition] = useState<ImagePosition>({ x: 50, y: 62 });
+  const [editorImageSize, setEditorImageSize] = useState<ImageSize>({ width: 32, height: 24 });
   const [editorImageRotation, setEditorImageRotation] = useState(0);
   const [editorCropLeft, setEditorCropLeft] = useState(0);
   const [editorCropRight, setEditorCropRight] = useState(0);
@@ -470,16 +580,39 @@ export default function App() {
   const scanFileInputRef = useRef<HTMLInputElement | null>(null);
   const imageFileInputRef = useRef<HTMLInputElement | null>(null);
   const editorPageRef = useRef<HTMLDivElement | null>(null);
+  const editorTextRef = useRef<HTMLDivElement | null>(null);
+  const editorSelectionRef = useRef<Range | null>(null);
   const drawingCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageDragOffset = useRef<ImagePosition | null>(null);
+  const imageResizeSession = useRef<ImageResizeSession | null>(null);
   const drawingPointer = useRef(false);
   const [translationText, setTranslationText] = useState('');
   const [translationSource, setTranslationSource] = useState('auto');
+  const [translationSourceLocked, setTranslationSourceLocked] = useState(false);
   const [translationTarget, setTranslationTarget] = useState('en');
   const [translationFile, setTranslationFile] = useState<File | null>(null);
+  const [translationExtractBusy, setTranslationExtractBusy] = useState(false);
+  const translationFileLoadId = useRef(0);
   const [translationResult, setTranslationResult] = useState('');
+  const [translationRevised, setTranslationRevised] = useState('');
   const [translationOutput, setTranslationOutput] = useState<ProcessedPdf | null>(null);
   const [translationSaveBusy, setTranslationSaveBusy] = useState(false);
+  const [humanizerInput, setHumanizerInput] = useState('');
+  const [humanizerOutput, setHumanizerOutput] = useState('');
+  const [humanizerBusy, setHumanizerBusy] = useState(false);
+  const [humanizerError, setHumanizerError] = useState('');
+  const [humanizerNotice, setHumanizerNotice] = useState('');
+  const [humanizerWritingStyle, setHumanizerWritingStyle] = useState<'simple' | 'professional' | 'conversational' | 'academic'>('simple');
+  const [humanizerStrength, setHumanizerStrength] = useState(3);
+  const [humanizerFile, setHumanizerFile] = useState<File | null>(null);
+  const [humanizerFileBusy, setHumanizerFileBusy] = useState(false);
+  const [humanizerDownloadFormat, setHumanizerDownloadFormat] = useState<'txt' | 'docx' | 'pdf'>('txt');
+  const humanizerFileRequestId = useRef(0);
+
+  useEffect(() => {
+    const editor = editorTextRef.current;
+    if (editor && editor.innerHTML !== editorText) editor.innerHTML = editorText;
+  }, [editorText]);
   const [translationMessage, setTranslationMessage] = useState('');
   const [translationBusy, setTranslationBusy] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<TemplateKind | null>(null);
@@ -494,6 +627,104 @@ export default function App() {
   const companion = companionFrom(avatar);
   const themeMode: 'light' | 'dark' = theme.endsWith('-dark') ? 'dark' : 'light';
   const paletteId = theme.slice(0, -(themeMode.length + 1)) as PaletteId;
+
+  const adminFetch = useCallback(async <T,>(path: string): Promise<T> => {
+    const response = await fetch(`${API}/api/admin/${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) {
+      const error = new Error(await responseError(response)) as Error & { status?: number };
+      error.status = response.status;
+      throw error;
+    }
+    return await response.json() as T;
+  }, [token]);
+
+  const expireAdminSession = useCallback(() => {
+    if (supabase) void supabase.auth.signOut();
+    localStorage.removeItem('vd-token');
+    setToken('');
+    setUser(null);
+    setAdminAccess('signed-out');
+    setAdminStats(null);
+    setAdminActivityPage(null);
+    setAdminUsersPage(null);
+    setSelectedAdminUser(null);
+    setAdminUserActivityPage(null);
+    setPage('Account / Privacy');
+  }, []);
+
+  function handleAdminRequestError(error: unknown) {
+    const status = error instanceof Error ? (error as Error & { status?: number }).status : undefined;
+    if (status === 401) {
+      expireAdminSession();
+      return;
+    }
+    if (status === 403) {
+      setAdminAccess('denied');
+      return;
+    }
+    setAdminDataError(error instanceof Error ? error.message : 'Could not load administrator data.');
+  }
+
+  useEffect(() => {
+    if (!token) {
+      setAdminAccess('signed-out');
+      setAdminStats(null);
+      return;
+    }
+    let active = true;
+    setAdminAccess((current) => current === 'allowed' ? 'allowed' : 'checking');
+    setAdminStatsError('');
+    adminFetch<AdminStats>('stats')
+      .then((stats) => {
+        if (!active) return;
+        setAdminStats(stats);
+        setAdminAccess('allowed');
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        const status = error instanceof Error ? (error as Error & { status?: number }).status : undefined;
+        if (status === 401) {
+          expireAdminSession();
+        } else if (status === 403) {
+          setAdminAccess('denied');
+          setAdminStats(null);
+        } else {
+          setAdminAccess((current) => current === 'allowed' ? 'allowed' : 'unavailable');
+          setAdminStatsError(error instanceof Error ? error.message : 'Could not verify administrator access.');
+        }
+      });
+    return () => { active = false; };
+  }, [token, adminFetch, adminRefreshVersion, expireAdminSession]);
+
+  useEffect(() => {
+    if (adminAccess !== 'allowed' || !token) return;
+    let active = true;
+    setAdminDataBusy(true);
+    setAdminDataError('');
+    const activityPath = `activity?limit=10&offset=${adminActivityOffset}`;
+    const usersPath = `users?limit=10&offset=${adminUsersOffset}`;
+    const historyRequest = selectedAdminUser
+      ? adminFetch<AdminPage<AdminActivity>>(`users/${selectedAdminUser.id}/activity?limit=10&offset=${adminUserActivityOffset}`)
+      : Promise.resolve(null);
+    Promise.all([
+      adminFetch<AdminPage<AdminActivity>>(activityPath),
+      adminFetch<AdminPage<AdminUser>>(usersPath),
+      historyRequest,
+    ]).then(([activity, users, history]) => {
+      if (!active) return;
+      setAdminActivityPage(activity);
+      setAdminUsersPage(users);
+      setAdminUserActivityPage(history);
+    }).catch((error: unknown) => {
+      if (!active) return;
+      handleAdminRequestError(error);
+    }).finally(() => {
+      if (active) setAdminDataBusy(false);
+    });
+    return () => { active = false; };
+  }, [adminAccess, token, adminFetch, adminActivityOffset, adminUsersOffset, selectedAdminUser, adminUserActivityOffset, adminRefreshVersion]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -580,7 +811,30 @@ export default function App() {
   }, [editorPdfFile, pdfPageDimensions]);
 
   useEffect(() => {
-    if (!token) return;
+    if (!supabase) return;
+    let active = true;
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (session?.access_token) {
+        localStorage.removeItem('vd-token');
+        setToken(session.access_token);
+      } else if (event === 'SIGNED_OUT') {
+        setToken('');
+      }
+    });
+    void supabase.auth.getSession().then(({ data }) => {
+      if (active && data.session?.access_token) {
+        localStorage.removeItem('vd-token');
+        setToken(data.session.access_token);
+      }
+    });
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!token || authResolving) return;
     fetch(`${API}/api/auth/me`, { headers: { Authorization: `Bearer ${token}` } })
       .then(async (response) => {
         if (!response.ok) throw new Error(await responseError(response));
@@ -596,7 +850,7 @@ export default function App() {
         setToken('');
         localStorage.removeItem('vd-token');
       });
-  }, [token]);
+  }, [token, authResolving]);
 
   const loadDocuments = useCallback(async () => {
     if (!token) {
@@ -660,9 +914,105 @@ export default function App() {
   }
 
   async function submitAuth() {
+    setAuthResolving(true);
     try {
       const endpoint = authMode === 'signup' ? '/api/auth/signup' : '/api/auth/login';
       const payload = authMode === 'signup' ? { name, email, password } : { email, password };
+      if (supabase) {
+        let accessToken = '';
+        if (authMode === 'signup') {
+          const { data, error } = await supabase.auth.signUp({
+            email: email.trim(),
+            password,
+            options: { data: { name: name.trim() } },
+          });
+          if (error) throw error;
+          if (!data.session?.access_token) {
+            setPassword('');
+            setNotice('Check your email to confirm your account, then sign in.');
+            return;
+          }
+          accessToken = data.session.access_token;
+        } else {
+          const { data, error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+          if (error) {
+            // Existing accounts can continue to use the legacy session until
+            // they are imported/linked in Supabase Auth.
+            const legacyResponse = await fetch(`${API}${endpoint}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            if (!legacyResponse.ok) throw error;
+            const legacyResult = await legacyResponse.json();
+            localStorage.setItem('vd-token', legacyResult.access_token);
+            setToken(legacyResult.access_token);
+            setUser(legacyResult.user as User);
+            setPassword('');
+            setPage('Home / Workspace');
+            setNotice('Signed in with your existing Vertex Docs session. Link your account after Supabase Auth migration.');
+            return;
+          }
+          if (!data.session?.access_token) throw new Error('Supabase did not return an active session.');
+          accessToken = data.session.access_token;
+        }
+
+        const bearerHeaders = {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        };
+        let profileResponse = await fetch(`${API}/api/auth/profile`, {
+          method: 'POST',
+          headers: bearerHeaders,
+          body: JSON.stringify({ name: name.trim() || 'Vertex Docs User' }),
+        });
+        let linkedWithLegacy = false;
+        if (profileResponse.status === 409) {
+          if (authMode !== 'login') {
+            await supabase.auth.signOut();
+            throw new Error('An existing Vertex Docs account requires sign-in with its existing password to link securely.');
+          }
+          const legacyResponse = await fetch(`${API}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password }),
+          });
+          if (!legacyResponse.ok) {
+            await supabase.auth.signOut();
+            throw new Error('This account needs secure linking. Sign in with the same existing password used for Vertex Docs.');
+          }
+          const legacyResult = await legacyResponse.json();
+          profileResponse = await fetch(`${API}/api/auth/link-supabase`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'X-Legacy-Token': legacyResult.access_token,
+            },
+          });
+          linkedWithLegacy = true;
+        }
+        if (!profileResponse.ok) throw new Error(await responseError(profileResponse));
+        const profile = await profileResponse.json() as User;
+        localStorage.removeItem('vd-token');
+        setAdminAccess('checking');
+        setAdminStats(null);
+        setAdminActivityPage(null);
+        setAdminUsersPage(null);
+        setSelectedAdminUser(null);
+        setAdminUserActivityPage(null);
+        setToken(accessToken);
+        setPassword('');
+        setUser(profile);
+        setTheme(themeFrom(profile.theme));
+        setAvatar(companionFrom(profile.avatar).id);
+        setLanguage(profile.language || 'en');
+        setPage('Home / Workspace');
+        setNotice(authMode === 'signup' ? 'Account created. You are signed in.' : 'You are signed in.');
+        if (authMode === 'login' && !linkedWithLegacy) {
+          void fetch(`${API}/api/auth/login-event`, { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` } }).catch(() => undefined);
+        }
+        return;
+      }
       const response = await fetch(`${API}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -670,13 +1020,13 @@ export default function App() {
       });
       if (!response.ok) throw new Error(await responseError(response));
       const result = await response.json();
-      if (authMode === 'signup') {
-        setAuthMode('login');
-        setPassword('');
-        setNotice('Account created. Sign in to sync your documents and settings.');
-        return;
-      }
       localStorage.setItem('vd-token', result.access_token);
+      setAdminAccess('checking');
+      setAdminStats(null);
+      setAdminActivityPage(null);
+      setAdminUsersPage(null);
+      setSelectedAdminUser(null);
+      setAdminUserActivityPage(null);
       setToken(result.access_token);
       setPassword('');
       setUser(result.user as User);
@@ -684,19 +1034,28 @@ export default function App() {
       setAvatar(companionFrom(result.user.avatar).id);
       setLanguage(result.user.language || 'en');
       setPage('Home / Workspace');
-      setNotice('You are signed in.');
+      setNotice(authMode === 'signup' ? 'Account created. You are signed in.' : 'You are signed in.');
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not sign in.');
+    } finally {
+      setAuthResolving(false);
     }
   }
 
   function signOut() {
+    if (supabase) void supabase.auth.signOut();
     window.speechSynthesis?.cancel();
     recognitionRef.current?.stop();
     recognitionRef.current = null;
     setIsListening(false);
     setIsSpeaking(false);
     setToken('');
+    setAdminAccess('signed-out');
+    setAdminStats(null);
+    setAdminActivityPage(null);
+    setAdminUsersPage(null);
+    setSelectedAdminUser(null);
+    setAdminUserActivityPage(null);
     setUser(null);
     setDocuments([]);
     setRecentUpload(null);
@@ -709,8 +1068,12 @@ export default function App() {
     setActiveChatId(null);
     setChatAttachment(null);
     setChatConversionOutput(null);
+    setName('');
+    setEmail('');
+    setPassword('');
+    setAuthMode('login');
     localStorage.removeItem('vd-token');
-    setNotice('You have signed out.');
+    setNotice('You have signed out. The next person can sign in with their own account.');
   }
 
   async function uploadDocument(file?: File) {
@@ -742,7 +1105,7 @@ export default function App() {
   function renderUploadNextSteps() {
     if (!recentUpload) return null;
     const extension = recentUpload.document.name.split('.').pop()?.toLowerCase() ?? '';
-    const canStudy = ['pdf', 'docx', 'txt', 'md'].includes(extension);
+    const canStudy = AI_READABLE_EXTENSIONS.includes(extension);
     const canConvert = conversionTools.some((tool) => tool.inputExtensions.includes(extension));
     const canEdit = extension === 'pdf';
     return (
@@ -768,7 +1131,7 @@ export default function App() {
             setAiDocMode('summary');
             setPage('AI Documents');
           }}>
-            <BookOpen size={19} /><b>Study with AI</b><small>{canStudy ? 'Summarize, ask questions, or translate this document.' : 'Supports PDF, DOCX, TXT, and Markdown.'}</small>
+            <BookOpen size={19} /><b>Study with AI</b><small>{canStudy ? 'Summarize, ask questions, or translate this document.' : 'Supports documents, spreadsheets, slides, ebooks, archives, and images.'}</small>
           </button>
           <button disabled={!canConvert} onClick={() => {
             setActiveConversion(null);
@@ -968,14 +1331,40 @@ export default function App() {
     }
   }
 
+  const chatAttachmentExtension = chatAttachment ? (chatAttachment.name.split('.').pop()?.toLowerCase() ?? '') : '';
+  const chatConversionTool = conversionTools.find((tool) => tool.name === chatConversionName) ?? conversionTools[0];
+  const chatConversionSupported = Boolean(chatAttachment && chatConversionTool.inputExtensions.includes(chatAttachmentExtension));
+
+  function chooseChatAttachment(file: File | null) {
+    if (!file) {
+      setChatAttachment(null);
+      return;
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      setChatAttachmentError('Files must be 50 MB or smaller.');
+      setChatAttachment(null);
+      return;
+    }
+    setChatAttachmentError('');
+    setChatAttachment(file);
+    const extension = file.name.split('.').pop()?.toLowerCase() ?? '';
+    const match = conversionTools.find((tool) => tool.inputExtensions.includes(extension));
+    if (match) setChatConversionName(match.name);
+  }
+
   async function convertChatAttachment() {
-    if (!token || !chatAttachment || chatConversionBusy) return;
+    if (!token || !chatAttachment || chatConversionBusy || !chatConversionTool) return;
+    const extension = chatAttachment.name.split('.').pop()?.toLowerCase() ?? '';
+    if (!chatConversionTool.inputExtensions.includes(extension)) {
+      setChatAttachmentError(`Choose a conversion that supports .${extension || 'this file type'}.`);
+      return;
+    }
     setChatConversionBusy(true);
     setChatAttachmentError('');
     try {
       const form = new FormData();
       form.append('file', chatAttachment);
-      form.append('output_format', chatConversionFormat);
+      form.append('output_format', chatConversionTool.outputFormat);
       const response = await fetch(`${API}/api/pdf/convert`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
@@ -983,9 +1372,13 @@ export default function App() {
       });
       if (!response.ok) throw new Error(await responseError(response));
       const blob = await response.blob();
-      const file = new File([blob], `vertex-converted.${chatConversionFormat}`, { type: blob.type });
+      const outputFormat = chatConversionTool.outputFormat;
+      const fallbackExtension = outputFormat === 'jpg' || outputFormat === 'png' ? 'zip' : outputFormat === 'pdfa' ? 'pdf' : outputFormat;
+      const disposition = response.headers.get('Content-Disposition') ?? '';
+      const filenameMatch = /filename="?([^";]+)"?/i.exec(disposition);
+      const file = new File([blob], filenameMatch?.[1] || `vertex-converted.${fallbackExtension}`, { type: blob.type });
       setChatConversionOutput({ file, url: URL.createObjectURL(file) });
-      setChatMessages((current) => [...current, { role: 'assistant', text: `Your ${chatConversionFormat.toUpperCase()} conversion of “${chatAttachment.name}” is ready. Download it below.` }]);
+      setChatMessages((current) => [...current, { role: 'assistant', text: `Your ${chatConversionTool.name} conversion of “${chatAttachment.name}” is ready. Download it below.` }]);
     } catch (error) {
       setChatAttachmentError(error instanceof Error ? error.message : 'The file could not be converted.');
     } finally {
@@ -1076,8 +1469,8 @@ export default function App() {
     }
   }
 
-  async function sendAiDocumentChat() {
-    const message = aiDocChatInput.trim();
+  async function sendAiDocumentChat(customPrompt?: string) {
+    const message = (customPrompt || aiDocChatInput).trim();
     if (!message || !selectedAiDoc || !token || aiDocChatBusy) return;
     const history = aiDocMessages.slice(-12).map((item) => ({ role: item.role, content: item.text }));
     setAiDocChatInput('');
@@ -1138,56 +1531,230 @@ export default function App() {
     setAiCompanionLine('Your translated text file is downloaded and ready to use!');
   }
 
-  async function runTranslation() {
+  async function extractBridgeText(file: File) {
+    const requestId = ++translationFileLoadId.current;
     if (!token) {
-      setTranslationResult('Sign in to use translation.');
+      setTranslationMessage('Sign in to extract text from your document.');
+      return;
+    }
+    setTranslationExtractBusy(true);
+    setTranslationMessage('Extracting document text…');
+    try {
+      const body = new FormData();
+      body.append('file', file);
+      const response = await fetch(`${API}/api/ai/chat/attachment-text`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body,
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { text: string };
+      if (requestId !== translationFileLoadId.current) return;
+      setTranslationText(result.text);
+      setTranslationSource(detectBridgeLanguage(result.text) ?? 'auto');
+      setTranslationSourceLocked(false);
+      setTranslationMessage('Document text extracted. Choose a target language and translate.');
+    } catch (error) {
+      if (requestId !== translationFileLoadId.current) return;
+      setTranslationMessage(error instanceof Error ? error.message : 'Could not extract text from this document.');
+    } finally {
+      if (requestId === translationFileLoadId.current) setTranslationExtractBusy(false);
+    }
+  }
+
+  function downloadBridgeText(filename: string, text: string) {
+    if (!text.trim()) return;
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function runTranslation(textOverride?: string, sourceOverride?: string, targetOverride?: string, isRevision = false) {
+    const useFile = !isRevision && textOverride === undefined && Boolean(translationFile);
+    const sourceLanguage = sourceOverride ?? (translationSource === 'auto' ? detectBridgeLanguage(translationText) ?? 'auto' : translationSource);
+    const targetLanguage = targetOverride ?? translationTarget;
+    const text = textOverride ?? translationText.trim();
+    if (!token) {
+      setTranslationMessage('Sign in to use translation.');
       setPage('Account / Privacy');
       return;
     }
-    if (!translationFile && !translationText.trim()) {
-      setTranslationResult('Enter text or choose a PDF, DOCX, TXT, or Markdown file.');
+    if (!useFile && !text) {
+      setTranslationMessage('Enter text or choose a PDF, DOCX, TXT, or Markdown file.');
       return;
     }
     setTranslationBusy(true);
-    setTranslationResult('');
     setTranslationMessage('');
     setTranslationOutput(null);
     try {
-      const body = translationFile ? new FormData() : JSON.stringify({
-        text: translationText.trim(),
-        source_language: translationSource,
-        target_language: translationTarget,
+      const body = useFile ? new FormData() : JSON.stringify({
+        text,
+        source_language: sourceLanguage,
+        target_language: targetLanguage,
       });
-      if (translationFile && body instanceof FormData) {
+      if (useFile && body instanceof FormData && translationFile) {
         body.append('file', translationFile);
-        body.append('source_language', translationSource);
-        body.append('target_language', translationTarget);
+        body.append('source_language', sourceLanguage);
+        body.append('target_language', targetLanguage);
       }
-      const response = await fetch(`${API}/api/ai/${translationFile ? 'translate-file' : 'translate'}`, {
+      const response = await fetch(`${API}/api/ai/${useFile ? 'translate-file' : 'translate'}`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
-          ...(!translationFile ? { 'Content-Type': 'application/json' } : {}),
+          ...(!useFile ? { 'Content-Type': 'application/json' } : {}),
         },
         body,
       });
       if (!response.ok) throw new Error(await responseError(response));
-      const result = await response.json() as { translation: string };
-      setTranslationResult(result.translation);
-      if (translationFile) {
+      const result = await response.json() as { translation: string; original_text?: string; detected_source_language?: string | null };
+      if (isRevision) setTranslationRevised(result.translation);
+      else setTranslationResult(result.translation);
+      const detectedSource = result.detected_source_language ?? (result.original_text ? detectBridgeLanguage(result.original_text) : null);
+      if (!translationSourceLocked && detectedSource) setTranslationSource(detectedSource);
+      if (useFile && result.original_text) setTranslationText(result.original_text);
+      if (useFile && translationFile) {
         const baseName = translationFile.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9-_]+/g, '-').replace(/^-|-$/g, '') || 'document';
-        const targetCode = translationTarget.replace(/[^a-zA-Z0-9-]/g, '') || 'translated';
+        const targetCode = targetLanguage.replace(/[^a-zA-Z0-9-]/g, '') || 'translated';
         const file = new File([result.translation], `vertex-${baseName}-${targetCode}.txt`, { type: 'text/plain;charset=utf-8' });
         setTranslationOutput({ file, url: URL.createObjectURL(file) });
         setTranslationMessage('Translation is ready. Download it or save it to your workspace history.');
       }
-      const targetName = languages.find(([code]) => code === translationTarget)?.[1] ?? 'your chosen language';
+      const targetName = languages.find(([code]) => code === targetLanguage)?.[1] ?? 'your chosen language';
       encourageUser(`Your ${targetName} translation is ready. Take a look—you’re doing great!`);
     } catch (error) {
-      setTranslationResult(error instanceof Error ? error.message : 'Translation failed.');
+      setTranslationMessage(error instanceof Error ? error.message : 'Translation failed.');
     } finally {
       setTranslationBusy(false);
     }
+  }
+
+  async function loadHumanizerFile(file: File) {
+    const requestId = ++humanizerFileRequestId.current;
+    const extension = file.name.split('.').pop()?.toLowerCase();
+    if (!extension || !['pdf', 'docx', 'txt'].includes(extension)) {
+      setHumanizerFile(null);
+      setHumanizerFileBusy(false);
+      setHumanizerError('Choose a PDF, DOCX, or TXT file.');
+      return;
+    }
+    setHumanizerFile(file);
+    setHumanizerInput('');
+    setHumanizerOutput('');
+    setHumanizerError('');
+    setHumanizerNotice('');
+    if (!token) {
+      setHumanizerError('Sign in to extract text from your document.');
+      return;
+    }
+    setHumanizerFileBusy(true);
+    try {
+      const body = new FormData();
+      body.append('file', file);
+      const response = await fetch(`${API}/api/ai/chat/attachment-text`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body,
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { text: string };
+      if (requestId !== humanizerFileRequestId.current) return;
+      setHumanizerInput(result.text);
+      setHumanizerNotice('Document text extracted. Review it, then choose your writing style and humanize it.');
+    } catch (error) {
+      if (requestId !== humanizerFileRequestId.current) return;
+      setHumanizerError(error instanceof Error ? error.message : 'Could not extract text from this document.');
+    } finally {
+      if (requestId === humanizerFileRequestId.current) setHumanizerFileBusy(false);
+    }
+  }
+
+  async function runHumanizer() {
+    if (!token) {
+      setHumanizerError('Sign in to use Humanizer.');
+      return;
+    }
+    if (!humanizerInput.trim()) {
+      setHumanizerError('Enter the text you want to humanize.');
+      return;
+    }
+    setHumanizerBusy(true);
+    setHumanizerError('');
+    setHumanizerNotice('');
+    try {
+      const response = await fetch(`${API}/api/ai/humanize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          text: humanizerInput.trim(),
+          writing_style: humanizerWritingStyle,
+          strength: humanizerStrength,
+        }),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { humanized_text: string };
+      setHumanizerOutput(result.humanized_text);
+      setHumanizerNotice('Your rewritten text is ready. Review it before using it.');
+    } catch (error) {
+      setHumanizerError(error instanceof Error ? error.message : 'Could not rewrite the text.');
+    } finally {
+      setHumanizerBusy(false);
+    }
+  }
+
+  async function copyHumanizerOutput() {
+    if (!humanizerOutput.trim()) return;
+    try {
+      await navigator.clipboard.writeText(humanizerOutput);
+      setHumanizerError('');
+      setHumanizerNotice('Humanized text copied to clipboard.');
+    } catch (error) {
+      setHumanizerError(error instanceof Error ? `Could not copy text: ${error.message}` : 'Could not copy text to clipboard.');
+    }
+  }
+
+  async function downloadHumanizerOutput() {
+    if (!token) {
+      setHumanizerError('Sign in to download the humanized document.');
+      return;
+    }
+    if (!humanizerOutput.trim()) return;
+    setHumanizerError('');
+    setHumanizerNotice('');
+    try {
+      const response = await fetch(`${API}/api/pdf/editor-export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ content: humanizerOutput, output_format: humanizerDownloadFormat, page_size: 'A4' }),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `humanized-text.${humanizerDownloadFormat}`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setHumanizerNotice(`Downloaded humanized-text.${humanizerDownloadFormat}.`);
+    } catch (error) {
+      setHumanizerError(error instanceof Error ? error.message : 'Could not download the humanized document.');
+    }
+  }
+
+  function resetHumanizer() {
+    humanizerFileRequestId.current += 1;
+    setHumanizerFile(null);
+    setHumanizerInput('');
+    setHumanizerOutput('');
+    setHumanizerWritingStyle('simple');
+    setHumanizerStrength(3);
+    setHumanizerDownloadFormat('txt');
+    setHumanizerFileBusy(false);
+    setHumanizerError('');
+    setHumanizerNotice('');
   }
 
   function clearTranslationOutput() {
@@ -1237,7 +1804,7 @@ export default function App() {
 
   function chooseTemplatePhoto(file?: File) {
     if (!file) return;
-    if (!['image/png','image/jpeg','image/webp'].includes(file.type)) {
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
       setPdfResult('Choose a PNG, JPEG, or WebP profile photo.');
       return;
     }
@@ -1338,10 +1905,10 @@ export default function App() {
     const activeTemplate = templateCatalog.find((item) => item.id === selectedTemplate);
     const fields = templateFields[selectedTemplate];
     const visiblePreviewFields = fields.filter((field) => (
-      !['full_name','title','email','phone','location','website'].includes(field.name)
+      !['full_name', 'title', 'email', 'phone', 'location', 'website'].includes(field.name)
       && templateDraft[field.name].trim()
     ));
-    const contact = [templateDraft.email,templateDraft.phone,templateDraft.location,templateDraft.website].filter(Boolean).join(' · ');
+    const contact = [templateDraft.email, templateDraft.phone, templateDraft.location, templateDraft.website].filter(Boolean).join(' · ');
     return (
       <>
         <div className="template-editor-heading">
@@ -1367,8 +1934,8 @@ export default function App() {
             {selectedTemplate === 'resume' && <div className="template-photo-uploader">
               <span className="template-photo-label">Profile photo <small>Optional · PNG, JPEG or WebP · up to 2 MB</small></span>
               <div>
-                <label className="template-photo-pick"><UploadCloud size={15}/>{templatePhotoName || 'Choose a photo'}<input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event)=>chooseTemplatePhoto(event.target.files?.[0])}/></label>
-                {templatePhotoPreview&&<button className="template-photo-remove" onClick={()=>{setTemplatePhotoData('');setTemplatePhotoPreview('');setTemplatePhotoName('');}}>Remove</button>}
+                <label className="template-photo-pick"><UploadCloud size={15} />{templatePhotoName || 'Choose a photo'}<input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => chooseTemplatePhoto(event.target.files?.[0])} /></label>
+                {templatePhotoPreview && <button className="template-photo-remove" onClick={() => { setTemplatePhotoData(''); setTemplatePhotoPreview(''); setTemplatePhotoName(''); }}>Remove</button>}
               </div>
             </div>}
             <button className="primary full-button" disabled={!token || templateBusy} onClick={() => void generateTemplatePdf()}>{templateBusy ? 'Creating PDF…' : 'Generate PDF preview'}</button>
@@ -1377,9 +1944,9 @@ export default function App() {
           </section>
           <section className="template-live-panel">
             <div className="template-live-caption"><span className="eyebrow">LIVE PREVIEW</span><small>{templateLayout} · {palettes.find((palette) => palette.id === templateAccent)?.name}</small></div>
-            <article className={`template-paper ${templateLayout} accent-${templateAccent} ${templatePhotoPreview?'has-photo':''}`}>
+            <article className={`template-paper ${templateLayout} accent-${templateAccent} ${templatePhotoPreview ? 'has-photo' : ''}`}>
               <span className="paper-kicker">{activeTemplate?.category}</span>
-              {templatePhotoPreview&&selectedTemplate==='resume'&&<img className="template-photo-preview" src={templatePhotoPreview} alt="Resume profile preview"/>}
+              {templatePhotoPreview && selectedTemplate === 'resume' && <img className="template-photo-preview" src={templatePhotoPreview} alt="Resume profile preview" />}
               <h2>{selectedTemplate === 'resume' ? (templateDraft.full_name || 'Your Name') : (templateDraft.title || activeTemplate?.name)}</h2>
               {selectedTemplate === 'resume' && templateDraft.title && <h3>{templateDraft.title}</h3>}
               {contact && <p className="paper-contact">{contact}</p>}
@@ -1426,7 +1993,7 @@ export default function App() {
             <div className="template-photo-uploader">
               <span className="template-photo-label">Profile photo <small>Optional · PNG, JPEG or WebP · up to 2 MB</small></span>
               <div>
-                <label className="template-photo-pick"><UploadCloud size={15}/>{templatePhotoName || 'Choose a photo'}<input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => { chooseTemplatePhoto(event.target.files?.[0]); event.target.value = ''; }} /></label>
+                <label className="template-photo-pick"><UploadCloud size={15} />{templatePhotoName || 'Choose a photo'}<input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => { chooseTemplatePhoto(event.target.files?.[0]); event.target.value = ''; }} /></label>
                 {templatePhotoPreview && <button className="template-photo-remove" onClick={() => { setTemplatePhotoData(''); setTemplatePhotoPreview(''); setTemplatePhotoName(''); }}>Remove</button>}
               </div>
             </div>
@@ -1897,8 +2464,45 @@ export default function App() {
     setEditorText(value);
   }
 
+  function rememberEditorSelection() {
+    const selection = window.getSelection();
+    if (selection?.rangeCount && editorTextRef.current?.contains(selection.anchorNode)) editorSelectionRef.current = selection.getRangeAt(0).cloneRange();
+  }
+
+  function formatEditor(command: string, value?: string, customFontSize?: string) {
+    const editor = editorTextRef.current;
+    if (!editor) return;
+    editor.focus();
+    const selection = window.getSelection();
+    if (editorSelectionRef.current && selection) {
+      selection.removeAllRanges();
+      selection.addRange(editorSelectionRef.current);
+    }
+    pushEditorHistory();
+    document.execCommand(command, false, value);
+    if (command === 'fontSize') {
+      editor.querySelectorAll('font[size="7"]').forEach((font) => {
+        const span = document.createElement('span');
+        span.style.fontSize = `${customFontSize ?? value}px`;
+        span.innerHTML = font.innerHTML;
+        font.replaceWith(span);
+      });
+    }
+    setEditorText(editor.innerHTML);
+    rememberEditorSelection();
+  }
+
+  function clearEditorFormatting() {
+    formatEditor('removeFormat');
+    formatEditor('unlink');
+  }
+
+  function applyFontSize(size: string) {
+    formatEditor('fontSize', '7', size);
+  }
+
   async function saveEditor() {
-    const hasEdits = Boolean(editorText.trim() || editorImagePreview || drawingHistory.length);
+    const hasEdits = Boolean(editorPlainText(editorText).trim() || editorImagePreview || drawingHistory.length);
     if (pdfOutput && !hasEdits) {
       await savePdfOutput();
       return;
@@ -1920,7 +2524,7 @@ export default function App() {
   }
 
   async function downloadEditor() {
-    const hasEdits = Boolean(editorText.trim() || editorImagePreview || drawingHistory.length);
+    const hasEdits = Boolean(editorPlainText(editorText).trim() || editorImagePreview || drawingHistory.length);
     if (pdfOutput && !hasEdits) {
       downloadPdfOutput();
       return;
@@ -1943,6 +2547,7 @@ export default function App() {
     setEditorImageName('');
     setEditorImageSelected(false);
     setEditorImagePosition({ x: 50, y: 62 });
+    setEditorImageSize({ width: 32, height: 24 });
     setEditorImageRotation(0);
     setEditorCropLeft(0);
     setEditorCropRight(0);
@@ -2002,7 +2607,7 @@ export default function App() {
 
   function changePdfPage(pageNumber: number) {
     if (!editorPdfFile || pageNumber < 1 || pageNumber > pdfPageCount || pageNumber === pdfPageNumber) return;
-    if (editorText.trim() || editorImageSource || drawingHistory.length) {
+    if (editorPlainText(editorText).trim() || editorImageSource || drawingHistory.length) {
       setPdfRenderError('Apply your current page edits as a PDF before moving to another page.');
       return;
     }
@@ -2023,7 +2628,7 @@ export default function App() {
       setPdfResult('Each PDF must be 50 MB or smaller.');
       return;
     }
-    const chosen = pdfAction === 'merge' ? selected : selected.slice(0, 1);
+    const chosen = pdfAction === 'merge' ? [...pdfFiles, ...selected] : selected.slice(0, 1);
     setPdfFiles(chosen);
     setEditorPdfFile(chosen[0]);
     setEditorText('');
@@ -2042,6 +2647,39 @@ export default function App() {
     void renderPdfPage(chosen[0], 1);
   }
 
+  function removeMergePdf(index: number) {
+    const next = pdfFiles.filter((_, fileIndex) => fileIndex !== index);
+    setPdfFiles(next);
+    setPdfOutput(null);
+    setPdfResult('');
+    if (index === 0) {
+      setEditorPdfFile(next[0] ?? null);
+      setPdfPageNumber(1);
+      setPdfPageImage('');
+      if (next[0]) void renderPdfPage(next[0], 1);
+      else {
+        setPdfPageCount(1);
+        setPdfPageDimensions({ width: 1000, height: 1414 });
+      }
+    }
+  }
+
+  function moveMergePdf(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= pdfFiles.length) return;
+    const next = [...pdfFiles];
+    [next[index], next[target]] = [next[target], next[index]];
+    setPdfFiles(next);
+    setPdfOutput(null);
+    setPdfResult('');
+    if (index === 0 || target === 0) {
+      setEditorPdfFile(next[0]);
+      setPdfPageNumber(1);
+      setPdfPageImage('');
+      void renderPdfPage(next[0], 1);
+    }
+  }
+
   async function loadEditorImage(file?: File) {
     if (!file) return;
     const allowed = ['image/png', 'image/jpeg', 'image/webp'];
@@ -2050,10 +2688,18 @@ export default function App() {
       return;
     }
     try {
-      setEditorImageSource(await readImageData(file));
+      const imageData = await readImageData(file);
+      const image = await loadImage(imageData);
+      setEditorImageSource(imageData);
       setEditorImageName(file.name);
       setEditorImageSelected(false);
       setEditorImagePosition({ x: 50, y: 62 });
+      const page = editorPageRef.current?.getBoundingClientRect();
+      const pageWidth = page?.width || 470;
+      const pageHeight = page?.height || pageWidth * 297 / 210;
+      const imageAspect = image.naturalWidth / image.naturalHeight;
+      const width = Math.min(48, 40 * pageWidth / pageHeight * imageAspect);
+      setEditorImageSize({ width, height: width * pageHeight / pageWidth / imageAspect });
       setEditorImageRotation(0);
       setEditorCropLeft(0);
       setEditorCropRight(0);
@@ -2083,17 +2729,102 @@ export default function App() {
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
+  function editorImagePreviewLoaded(event: SyntheticEvent<HTMLImageElement>) {
+    const image = event.currentTarget;
+    const page = editorPageRef.current?.getBoundingClientRect();
+    if (!page || !image.naturalWidth || !image.naturalHeight) return;
+    const pageWidth = page.width;
+    const pageHeight = page.height;
+    const pageAspect = pageWidth / pageHeight;
+    const ratioInPage = image.naturalWidth / image.naturalHeight * pageAspect;
+    const area = editorImageSize.width * editorImageSize.height;
+    let width = Math.sqrt(area * ratioInPage);
+    let height = width / ratioInPage;
+    if (width > 96) { width = 96; height = width / ratioInPage; }
+    if (height > 96) { height = 96; width = height * ratioInPage; }
+    setEditorImageSize({ width, height });
+    setEditorImagePosition((position) => ({
+      x: Math.max(width / 2, Math.min(100 - width / 2, position.x)),
+      y: Math.max(height / 2, Math.min(100 - height / 2, position.y)),
+    }));
+  }
+
+  function editorImageResizeStart(event: ReactPointerEvent<HTMLButtonElement>, handle: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    setEditorImageSelected(true);
+    const page = editorPageRef.current?.getBoundingClientRect();
+    const image = event.currentTarget.parentElement?.getBoundingClientRect();
+    if (!page || !image) return;
+    imageResizeSession.current = {
+      handle, startX: event.clientX, startY: event.clientY,
+      left: image.left - page.left, top: image.top - page.top,
+      width: image.width, height: image.height, aspect: image.width / image.height,
+      pageWidth: page.width, pageHeight: page.height,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function editorImageResizeMove(event: ReactPointerEvent<HTMLButtonElement>) {
+    const session = imageResizeSession.current;
+    if (!session) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const { handle, startX, startY, left, top, width, height, aspect, pageWidth, pageHeight } = session;
+    const east = handle.includes('e');
+    const west = handle.includes('w');
+    const north = handle.includes('n');
+    const south = handle.includes('s');
+    const dx = event.clientX - startX;
+    const dy = event.clientY - startY;
+    const minSize = 24;
+    let nextWidth = width;
+    let nextHeight = height;
+    if ((east || west) && (north || south)) {
+      const widthChange = dx * (east ? 1 : -1);
+      const heightAsWidthChange = dy * (south ? 1 : -1) * aspect;
+      nextWidth = width + (Math.abs(widthChange) >= Math.abs(heightAsWidthChange) ? widthChange : heightAsWidthChange);
+      nextHeight = nextWidth / aspect;
+    } else if (east || west) nextWidth = width + dx * (east ? 1 : -1);
+    else nextHeight = height + dy * (south ? 1 : -1);
+
+    const availableWidth = west ? left + width : east ? pageWidth - left : pageWidth;
+    const availableHeight = north ? top + height : south ? pageHeight - top : pageHeight;
+    if ((east || west) && (north || south)) {
+      const maxWidth = Math.min(availableWidth, availableHeight * aspect);
+      nextWidth = Math.max(Math.min(minSize, maxWidth), Math.min(nextWidth, maxWidth));
+      nextHeight = nextWidth / aspect;
+    } else {
+      if (east || west) nextWidth = Math.max(Math.min(minSize, availableWidth), Math.min(nextWidth, availableWidth));
+      if (north || south) nextHeight = Math.max(Math.min(minSize, availableHeight), Math.min(nextHeight, availableHeight));
+    }
+    let nextLeft = west ? left + width - nextWidth : left;
+    let nextTop = north ? top + height - nextHeight : top;
+    nextLeft = Math.max(0, Math.min(pageWidth - nextWidth, nextLeft));
+    nextTop = Math.max(0, Math.min(pageHeight - nextHeight, nextTop));
+    setEditorImageSize({ width: nextWidth / pageWidth * 100, height: nextHeight / pageHeight * 100 });
+    setEditorImagePosition({ x: (nextLeft + nextWidth / 2) / pageWidth * 100, y: (nextTop + nextHeight / 2) / pageHeight * 100 });
+  }
+
+  function editorImageResizeEnd(event?: ReactPointerEvent<HTMLButtonElement>) {
+    event?.stopPropagation();
+    imageResizeSession.current = null;
+  }
+
   function editorPagePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
     if (!imageDragOffset.current) return;
     const page = editorPageRef.current?.getBoundingClientRect();
     if (!page) return;
+    const halfWidth = editorImageSize.width / 2;
+    const halfHeight = editorImageSize.height / 2;
     const x = (event.clientX - page.left) / page.width * 100 - imageDragOffset.current.x;
     const y = (event.clientY - page.top) / page.height * 100 - imageDragOffset.current.y;
-    setEditorImagePosition({ x: Math.max(4, Math.min(96, x)), y: Math.max(4, Math.min(96, y)) });
+    setEditorImagePosition({ x: Math.max(halfWidth, Math.min(100 - halfWidth, x)), y: Math.max(halfHeight, Math.min(100 - halfHeight, y)) });
   }
 
   function editorPagePointerUp() {
     imageDragOffset.current = null;
+    imageResizeSession.current = null;
   }
 
   function restoreDrawing(data: string) {
@@ -2196,12 +2927,11 @@ export default function App() {
     context.fillRect(0, 0, preview.width, preview.height);
     const drawing = drawingCanvasRef.current;
     if (drawing) context.drawImage(drawing, 0, 0, preview.width, preview.height);
-    drawEditorText(context, preview.width, preview.height, editorText);
+    await drawRichText(context, editorText, preview.width, preview.height);
     if (editorImagePreview) {
       const image = await loadImage(editorImagePreview);
-      const scale = Math.min(320 / image.width, 390 / image.height, 1);
-      const width = image.width * scale;
-      const height = image.height * scale;
+      const width = preview.width * editorImageSize.width / 100;
+      const height = preview.height * editorImageSize.height / 100;
       const centerX = editorImagePosition.x / 100 * preview.width;
       const centerY = editorImagePosition.y / 100 * preview.height;
       context.drawImage(image, centerX - width / 2, centerY - height / 2, width, height);
@@ -2215,15 +2945,13 @@ export default function App() {
     overlay.height = pdfPageDimensions.height;
     const context = overlay.getContext('2d');
     if (!context) throw new Error('Document editing is not available in this browser.');
-    const scale = overlay.width / 1000;
     const drawing = drawingCanvasRef.current;
     if (drawing) context.drawImage(drawing, 0, 0, overlay.width, overlay.height);
-    drawEditorText(context, overlay.width, overlay.height, editorText);
+    await drawRichText(context, editorText, overlay.width, overlay.height);
     if (editorImagePreview) {
       const image = await loadImage(editorImagePreview);
-      const imageScale = Math.min(320 * scale / image.width, 390 * scale / image.height, 1);
-      const width = image.width * imageScale;
-      const height = image.height * imageScale;
+      const width = overlay.width * editorImageSize.width / 100;
+      const height = overlay.height * editorImageSize.height / 100;
       const centerX = editorImagePosition.x / 100 * overlay.width;
       const centerY = editorImagePosition.y / 100 * overlay.height;
       context.drawImage(image, centerX - width / 2, centerY - height / 2, width, height);
@@ -2254,7 +2982,7 @@ export default function App() {
         form.append('overlay_data', await editorPdfOverlay());
         response = await fetch(`${API}/api/pdf/annotate`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form });
       } else if (editorPdfFile) {
-        if (editorText.trim() || editorImagePreview || hasDrawing) {
+        if (editorPlainText(editorText).trim() || editorImagePreview || hasDrawing) {
           throw new Error('To keep edits on the opened PDF, export as PDF. DOCX and TXT conversions extract the original file content.');
         }
         const form = new FormData();
@@ -2262,7 +2990,7 @@ export default function App() {
         form.append('output_format', editorExportFormat);
         response = await fetch(`${API}/api/pdf/convert`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form });
       } else {
-        const body: Record<string, string> = { content: editorText, output_format: editorExportFormat, page_size: 'A4' };
+        const body: Record<string, string> = { content: editorPlainText(editorText), output_format: editorExportFormat, page_size: 'A4' };
         if (editorImagePreview) body.image_data = editorImagePreview.split(',')[1];
         if (editorExportFormat === 'pdf') body.page_preview_data = await editorPagePreview();
         if (editorExportFormat === 'docx' && hasDrawing && canvas) body.drawing_data = canvas.toDataURL('image/png').split(',')[1];
@@ -2330,12 +3058,12 @@ export default function App() {
         const extension = item.name.split('.').pop()?.toLowerCase() ?? '';
         const matchesType = historyFilter === 'all'
           || (historyFilter === 'pdf' && extension === 'pdf')
-          || (historyFilter === 'word' && ['doc','docx'].includes(extension))
-          || (historyFilter === 'text' && ['txt','md'].includes(extension));
+          || (historyFilter === 'word' && ['doc', 'docx'].includes(extension))
+          || (historyFilter === 'text' && ['txt', 'md'].includes(extension));
         return matchesType && item.name.toLowerCase().includes(historyQuery.trim().toLowerCase());
       })
-      .sort((a,b) => historySort === 'name' ? a.name.localeCompare(b.name) : b.size-a.size);
-    const totalBytes = documents.reduce((sum,item) => sum + item.size,0);
+      .sort((a, b) => historySort === 'name' ? a.name.localeCompare(b.name) : b.size - a.size);
+    const totalBytes = documents.reduce((sum, item) => sum + item.size, 0);
     const pdfCount = documents.filter((item) => item.name.toLowerCase().endsWith('.pdf')).length;
     return (
       <>
@@ -2356,7 +3084,7 @@ export default function App() {
             <label className="history-sort">Sort by<select value={historySort} onChange={(event) => setHistorySort(event.target.value as 'name' | 'largest')}><option value="name">Name</option><option value="largest">Largest</option></select></label>
           </div>
           <div className="history-filters" role="group" aria-label="Filter documents by type">
-            {([['all','All files'],['pdf','PDF'],['word','Word'],['text','Text']] as const).map(([id,label]) => <button key={id} className={historyFilter===id?'active':''} aria-pressed={historyFilter===id} onClick={() => setHistoryFilter(id)}>{label}</button>)}
+            {([['all', 'All files'], ['pdf', 'PDF'], ['word', 'Word'], ['text', 'Text']] as const).map(([id, label]) => <button key={id} className={historyFilter === id ? 'active' : ''} aria-pressed={historyFilter === id} onClick={() => setHistoryFilter(id)}>{label}</button>)}
           </div>
           {!token ? <div className="empty-state">Sign in to view your private document history.</div>
             : !documents.length ? <div className="history-empty"><FileText size={28} /><b>Your workspace is ready</b><span>Upload a PDF or document to start building your library.</span></div>
@@ -2389,7 +3117,7 @@ export default function App() {
         <section className="ai-companion-card">
           <span className="ai-companion-character" aria-hidden="true">{companion.emoji}</span>
           <div className="ai-companion-copy"><b>{companion.name} is here to help</b><p role="status" aria-live="polite">{aiCompanionLine}</p></div>
-          <button onClick={() => speakText(aiCompanionLine)} title="Read companion message aloud"><Volume2 size={16} /><span>{isSpeaking?'Speaking…':'Listen'}</span></button>
+          <button onClick={() => speakText(aiCompanionLine)} title="Read companion message aloud"><Volume2 size={16} /><span>{isSpeaking ? 'Speaking…' : 'Listen'}</span></button>
         </section>
         <section className="panel ai-document-picker">
           <div className="ai-document-picker-copy"><span className="eyebrow">CHOOSE A DOCUMENT</span><h2>What would you like to work on?</h2><p>Select a file already in your workspace. Your document stays private to your account.</p></div>
@@ -2400,14 +3128,14 @@ export default function App() {
                 {documents.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
               </select>
             </label>
-            <label className="primary button-label"><UploadCloud size={16} /> Upload a document<input type="file" accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" onChange={async (event) => {
-              const file=event.target.files?.[0];
+            <label className="primary button-label"><UploadCloud size={16} /> Upload a document<input type="file" accept={AI_READABLE_ACCEPT} onChange={async (event) => {
+              const file = event.target.files?.[0];
               if (!file || !token) { setAiCompanionLine('Sign in before uploading a document for AI features.'); return; }
-              const form=new FormData(); form.append('file',file);
+              const form = new FormData(); form.append('file', file);
               try {
-                const response=await fetch(`${API}/api/documents/upload`,{method:'POST',headers:{Authorization:`Bearer ${token}`},body:form});
+                const response = await fetch(`${API}/api/documents/upload`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form });
                 if (!response.ok) throw new Error(await responseError(response));
-                const uploaded=await response.json() as {id:number;name:string};
+                const uploaded = await response.json() as { id: number; name: string };
                 await loadDocuments();
                 chooseAiDocument(String(uploaded.id));
                 setAiCompanionLine(`“${uploaded.name}” is ready. Choose what you’d like to do with it!`);
@@ -2421,43 +3149,47 @@ export default function App() {
         </section>
         <div className="ai-document-workspace">
           <nav className="ai-mode-tabs" role="tablist" aria-label="AI document actions">
-            {([['summary','Summarize',BookOpen],['chat','Ask your document',MessageCircle],['translate','Translate',Languages]] as const).map(([mode,label,Icon]) => <button key={mode} className={aiDocMode===mode?'active':''} role="tab" aria-selected={aiDocMode===mode} onClick={() => {setAiDocMode(mode);setVoiceFeedback('');}}><Icon size={16}/>{label}</button>)}
+            {([['summary', 'Summarize', BookOpen], ['chat', 'Ask your document', MessageCircle], ['translate', 'Translate', Languages]] as const).map(([mode, label, Icon]) => <button key={mode} className={aiDocMode === mode ? 'active' : ''} role="tab" aria-selected={aiDocMode === mode} onClick={() => { setAiDocMode(mode); setVoiceFeedback(''); }}><Icon size={16} />{label}</button>)}
           </nav>
           <div className="panel ai-document-panel">
             <div className="ai-language-choice"><label className="field-label">Assistant language
-              <select value={language} onChange={(event) => void savePreferences({language:event.target.value})}>{languages.map(([code,label]) => <option key={code} value={code}>{label}</option>)}</select>
+              <select value={language} onChange={(event) => void savePreferences({ language: event.target.value })}>{languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}</select>
             </label><small>13 choices, including Tanglish. Voice input and playback use your device’s available language voices.</small></div>
-            {!selectedDocument ? <div className="ai-select-prompt"><span>{companion.emoji}</span><b>Pick a document to begin</b><p>Choose an uploaded PDF, DOCX, TXT, or Markdown file above.</p></div>
-              : aiDocMode==='summary' ? <div className="ai-summary-workspace">
-                <div className="ai-feature-intro"><span className="ai-feature-icon"><BookOpen size={20}/></span><div><h2>A helpful summary, in your language</h2><p>Get the main ideas, key details and action items from <b>{selectedLabel}</b>.</p></div></div>
-                <button className="primary ai-action-button" disabled={!token||aiDocSummaryBusy} onClick={() => void summarizeAiDocument()}>{aiDocSummaryBusy?<RefreshCw className="spin" size={16}/>:<Sparkles size={16}/>} {aiDocSummaryBusy?'Reading your document…':'Summarize document'}</button>
-                {aiDocSummary && <section className="ai-response-card"><div className="ai-response-heading"><span className="ai-response-avatar">{companion.emoji}</span><span><b>{companion.name}’s summary</b><small>{selectedLabel}</small></span><button aria-label="Read summary aloud" onClick={() => speakText(aiDocSummary)}><Volume2 size={16}/><span>Listen</span></button></div><p>{aiDocSummary}</p></section>}
+            {!selectedDocument ? <div className="ai-select-prompt"><span>{companion.emoji}</span><b>Pick a document to begin</b><p>Choose an uploaded document, spreadsheet, slide deck, ebook, archive, or image above.</p></div>
+              : aiDocMode === 'summary' ? <div className="ai-summary-workspace">
+                <div className="ai-feature-intro"><span className="ai-feature-icon"><BookOpen size={20} /></span><div><h2>A helpful summary, in your language</h2><p>Get the main ideas, key details and action items from <b>{selectedLabel}</b>.</p></div></div>
+                <button className="primary ai-action-button" disabled={!token || aiDocSummaryBusy} onClick={() => void summarizeAiDocument()}>{aiDocSummaryBusy ? <RefreshCw className="spin" size={16} /> : <Sparkles size={16} />} {aiDocSummaryBusy ? 'Reading your document…' : 'Summarize document'}</button>
+                {aiDocSummary && <section className="ai-response-card"><div className="ai-response-heading"><span className="ai-response-avatar">{companion.emoji}</span><span><b>{companion.name}’s summary</b><small>{selectedLabel}</small></span><button aria-label="Read summary aloud" onClick={() => speakText(aiDocSummary)}><Volume2 size={16} /><span>Listen</span></button></div><p>{aiDocSummary}</p></section>}
               </div>
-                : aiDocMode==='chat' ? <div className="ai-chat-workspace">
-                  <div className="ai-feature-intro"><span className="ai-feature-icon"><MessageCircle size={20}/></span><div><h2>Ask questions about your file</h2><p>Your answers are grounded in <b>{selectedLabel}</b> and reply in the selected assistant language.</p></div></div>
-                  <div className="ai-chat-transcript" role="log" aria-live="polite">
-                    {!aiDocMessages.length && <div className="ai-chat-welcome"><span>{companion.emoji}</span><div><b>Hi, I’m {companion.name}!</b><p>Ask me to explain a section, find a date, or clarify an idea from this document.</p></div></div>}
-                    {aiDocMessages.map((message,index)=><div className={`ai-chat-line ${message.role}`} key={`${message.role}-${index}`}><span className="ai-chat-avatar">{message.role==='assistant'?companion.emoji:'You'}</span><div className="ai-chat-bubble"><p>{message.text}</p>{message.role==='assistant'&&<button aria-label="Read assistant reply aloud" onClick={() => speakText(message.text)}><Volume2 size={14}/> Listen</button>}</div></div>)}
-                    {aiDocChatBusy&&<div className="ai-chat-line assistant"><span className="ai-chat-avatar">{companion.emoji}</span><div className="ai-chat-bubble typing-indicator">Thinking it through…</div></div>}
+                : aiDocMode === 'chat' ? (
+                  <div className="ai-chat-workspace">
+                    <AiDocChat
+                      selectedLabel={selectedLabel}
+                      companion={companion}
+                      messages={aiDocMessages}
+                      busy={aiDocChatBusy}
+                      input={aiDocChatInput}
+                      onInputChange={setAiDocChatInput}
+                      onSend={(overridePrompt) => void sendAiDocumentChat(overridePrompt)}
+                      isListening={isListening}
+                      startVoiceInput={startVoiceInput}
+                      speakText={speakText}
+                    />
                   </div>
-                  <div className="ai-chat-compose"><textarea value={aiDocChatInput} onChange={(event)=>setAiDocChatInput(event.target.value)} onKeyDown={(event)=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();void sendAiDocumentChat();}}} placeholder={`Ask ${selectedLabel} a question…`} aria-label="Message about the selected document" />
-                    <button className={isListening?'voice-active':''} aria-label={isListening?'Stop voice input':'Speak your question'} aria-pressed={isListening} onClick={()=>startVoiceInput((text)=>setAiDocChatInput((current)=>[current,text].filter(Boolean).join(' ')))}><Mic size={17}/></button>
-                    <button className="primary" aria-label="Send question" disabled={!aiDocChatInput.trim()||aiDocChatBusy} onClick={()=>void sendAiDocumentChat()}><Send size={17}/></button>
-                  </div>
-                </div>
+                )
                   : <div className="ai-translate-workspace">
-                    <div className="ai-feature-intro"><span className="ai-feature-icon"><Languages size={20}/></span><div><h2>Translate the whole document</h2><p>Keep the original untouched and get a translated text file you can download.</p></div></div>
+                    <div className="ai-feature-intro"><span className="ai-feature-icon"><Languages size={20} /></span><div><h2>Translate the whole document</h2><p>Keep the original untouched and get a translated text file you can download.</p></div></div>
                     <div className="translation-language-row ai-translation-language-row">
-                      <label className="field-label">From<select value={aiDocSource} onChange={(event)=>setAiDocSource(event.target.value)}><option value="auto">Detect language</option>{languages.map(([code,label])=><option key={code} value={code}>{label}</option>)}</select></label>
-                      <ArrowLeftRight className="translation-arrow" size={18}/>
-                      <label className="field-label">To<select value={aiDocTarget} onChange={(event)=>setAiDocTarget(event.target.value)}>{languages.map(([code,label])=><option key={code} value={code}>{label}</option>)}</select></label>
+                      <label className="field-label">From<select value={aiDocSource} onChange={(event) => setAiDocSource(event.target.value)}><option value="auto">Detect language</option>{languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}</select></label>
+                      <ArrowLeftRight className="translation-arrow" size={18} />
+                      <label className="field-label">To<select value={aiDocTarget} onChange={(event) => setAiDocTarget(event.target.value)}>{languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}</select></label>
                     </div>
-                    <button className="primary ai-action-button" disabled={!token||aiDocTranslateBusy} onClick={()=>void translateAiDocument()}>{aiDocTranslateBusy?<RefreshCw className="spin" size={16}/>:<Languages size={16}/>} {aiDocTranslateBusy?'Translating document…':'Translate document'}</button>
-                    {aiDocTranslation&&<section className="ai-response-card"><div className="ai-response-heading"><span className="ai-response-avatar">{companion.emoji}</span><span><b>Translation ready</b><small>{languages.find(([code])=>code===aiDocTarget)?.[1]}</small></span><button onClick={()=>speakText(aiDocTranslation,aiDocTarget)}><Volume2 size={16}/><span>Listen</span></button></div><p>{aiDocTranslation}</p><button className="download-translation-button" onClick={downloadAiTranslation}><Download size={15}/>Download translated text</button></section>}
+                    <button className="primary ai-action-button" disabled={!token || aiDocTranslateBusy} onClick={() => void translateAiDocument()}>{aiDocTranslateBusy ? <RefreshCw className="spin" size={16} /> : <Languages size={16} />} {aiDocTranslateBusy ? 'Translating document…' : 'Translate document'}</button>
+                    {aiDocTranslation && <section className="ai-response-card"><div className="ai-response-heading"><span className="ai-response-avatar">{companion.emoji}</span><span><b>Translation ready</b><small>{languages.find(([code]) => code === aiDocTarget)?.[1]}</small></span><button onClick={() => speakText(aiDocTranslation, aiDocTarget)}><Volume2 size={16} /><span>Listen</span></button></div><p>{aiDocTranslation}</p><button className="download-translation-button" onClick={downloadAiTranslation}><Download size={15} />Download translated text</button></section>}
                   </div>}
-            {!token&&<p className="inline-hint">Sign in to summarize, chat with, or translate your documents. Add an LLM_API_KEY in the backend environment to enable AI.</p>}
-            {aiDocError&&<p className="ai-error" role="alert">{aiDocError}</p>}
-            {voiceFeedback&&<p className="voice-feedback" role="status">{voiceFeedback}</p>}
+            {!token && <p className="inline-hint">Sign in to summarize, chat with, or translate your documents.</p>}
+            {aiDocError && <p className="ai-error" role="alert">{aiDocError}</p>}
+            {voiceFeedback && <p className="voice-feedback" role="status">{voiceFeedback}</p>}
           </div>
         </div>
       </>
@@ -2476,14 +3208,14 @@ export default function App() {
     ];
     const drawCanvas = drawingCanvasRef.current;
     const hasDrawing = Boolean(drawCanvas && drawingHistory.length);
-    const hasEditorWork = Boolean(pdfOutput || pdfFiles.length || editorText.trim() || editorImagePreview || drawingHistory.length);
+    const hasEditorWork = Boolean(pdfOutput || pdfFiles.length || editorPlainText(editorText).trim() || editorImagePreview || drawingHistory.length);
     return (
       <>
         <PageHeading eyebrow="PDF STUDIO" title="A clear space for document work" subtitle="Edit a new page or run a PDF tool. Results appear here for review before you keep them." />
         <div className="pdf-editor-toolbar">
           <button onClick={resetEditor}><FilePlus2 size={15} /> New page</button>
           <button onClick={() => pdfFileInputRef.current?.click()}><UploadCloud size={15} /> Open PDF</button>
-          <input ref={pdfFileInputRef} type="file" accept="application/pdf,.pdf" multiple={pdfAction === 'merge'} onChange={(event) => { selectPdfFiles(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
+          <input ref={pdfFileInputRef} type="file" accept="application/pdf,.pdf" onChange={(event) => { selectPdfFiles(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
           <button disabled={!token || pdfSaveBusy || editorBusy || (!pdfOutput && !hasEditorWork)} onClick={() => void saveEditor()}><Save size={15} /> {pdfSaveBusy ? 'Saving…' : 'Save'}</button>
           <button disabled={!editorUndoHistory.length} onClick={undoEditor}><Undo2 size={15} /> Undo</button>
           <button disabled={!editorRedoHistory.length} onClick={redoEditor}><Redo2 size={15} /> Redo</button>
@@ -2492,6 +3224,18 @@ export default function App() {
           </select>
           <button className="primary" disabled={!token || editorBusy} onClick={() => void exportEditor()}>{editorBusy ? 'Creating…' : `Create ${editorExportFormat.toUpperCase()}`}</button>
           <button disabled={!hasEditorWork || (!token && !editorPdfFile && !pdfOutput)} onClick={() => void downloadEditor()}><Download size={15} /> Download</button>
+        </div>
+        <div className="word-format-toolbar" role="toolbar" aria-label="Text formatting" onMouseDown={(event) => { if ((event.target as HTMLElement).closest('button')) event.preventDefault(); }}>
+          <select aria-label="Font family" defaultValue="Arial" onFocus={rememberEditorSelection} onChange={(event) => formatEditor('fontName', event.target.value)}><option>Arial</option><option>Calibri</option><option>Georgia</option><option>Times New Roman</option><option>Verdana</option></select>
+          <select aria-label="Font size" defaultValue="14" onFocus={rememberEditorSelection} onChange={(event) => applyFontSize(event.target.value)}>{[8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48].map((size) => <option key={size} value={size}>{size}</option>)}</select>
+          <span className="word-toolbar-divider" />
+          <button title="Bold" aria-label="Bold" onClick={() => formatEditor('bold')}><Bold size={15} /></button><button title="Italic" aria-label="Italic" onClick={() => formatEditor('italic')}><Italic size={15} /></button><button title="Underline" aria-label="Underline" onClick={() => formatEditor('underline')}><Underline size={15} /></button><button title="Strikethrough" aria-label="Strikethrough" onClick={() => formatEditor('strikeThrough')}><Strikethrough size={15} /></button>
+          <label className="word-color-control" title="Font colour" aria-label="Font colour"><span>A</span><input type="color" defaultValue="#252b38" onFocus={rememberEditorSelection} onChange={(event) => formatEditor('foreColor', event.target.value)} /></label>
+          <label className="word-color-control highlight-control" title="Text highlight" aria-label="Text highlight"><Highlighter size={15} /><input type="color" defaultValue="#fff2a1" onFocus={rememberEditorSelection} onChange={(event) => formatEditor('hiliteColor', event.target.value)} /></label>
+          <span className="word-toolbar-divider" />
+          <button title="Align left" aria-label="Align left" onClick={() => formatEditor('justifyLeft')}><AlignLeft size={15} /></button><button title="Centre" aria-label="Centre" onClick={() => formatEditor('justifyCenter')}><AlignCenter size={15} /></button><button title="Align right" aria-label="Align right" onClick={() => formatEditor('justifyRight')}><AlignRight size={15} /></button><button title="Justify" aria-label="Justify" onClick={() => formatEditor('justifyFull')}><AlignJustify size={15} /></button>
+          <button title="Bulleted list" aria-label="Bulleted list" onClick={() => formatEditor('insertUnorderedList')}><List size={15} /></button><button title="Numbered list" aria-label="Numbered list" onClick={() => formatEditor('insertOrderedList')}><ListOrdered size={15} /></button><button title="Decrease indent" aria-label="Decrease indent" onClick={() => formatEditor('outdent')}><Outdent size={15} /></button><button title="Increase indent" aria-label="Increase indent" onClick={() => formatEditor('indent')}><Indent size={15} /></button>
+          <button title="Clear formatting" aria-label="Clear formatting" onClick={clearEditorFormatting}><RemoveFormatting size={15} /></button>
         </div>
         <div className="pdf-editor-layout">
           <section className="panel pdf-tool-panel">
@@ -2525,21 +3269,39 @@ export default function App() {
             </div>
             <div className={`editor-stage ${editorDropActive ? 'editor-drop-active' : ''}`} onDragOver={(event) => { event.preventDefault(); setEditorDropActive(true); }} onDragLeave={() => setEditorDropActive(false)} onDrop={(event) => { event.preventDefault(); setEditorDropActive(false); const file = event.dataTransfer.files[0]; if (file?.type === 'application/pdf' || file?.name.toLowerCase().endsWith('.pdf')) selectPdfFiles(Array.from(event.dataTransfer.files)); else void loadEditorImage(file); }}>
               {pdfOutput && pdfOutput.file.type !== 'application/pdf' ? <div className="editor-nonpdf-result"><FileText size={32} /><b>{pdfOutput.file.name} is ready</b><span>Preview is available after you download or open this file.</span></div>
-                : hasPdfCanvas || (!pdfSourceUrl && !pdfOutput) ? <div className="editor-page" ref={editorPageRef} style={hasPdfCanvas ? { aspectRatio: `${pdfPageDimensions.width} / ${pdfPageDimensions.height}` } : undefined} onClick={(event) => { if (!(event.target instanceof Element) || !event.target.closest('.editor-page-photo, .editor-image-float-tools')) setEditorImageSelected(false); }} onPointerMove={editorPagePointerMove} onPointerUp={editorPagePointerUp} onPointerCancel={editorPagePointerUp}>
-                      {hasPdfCanvas && <img className="editor-page-pdf-bg" src={pdfPageImage} alt={`PDF page ${pdfPageNumber}`} draggable={false} />}
-                      <textarea className="editor-page-text" aria-label="Document text" value={editorText} onChange={(event) => updateEditorText(event.target.value)} style={{ pointerEvents: editorTool === 'text' ? 'auto' : 'none' }} placeholder="Click here and start typing…" />
-                      {editorImagePreview && <img className={`editor-page-photo ${editorImageSelected ? 'selected' : ''}`} src={editorImagePreview} alt={editorImageName || 'Inserted document image'} draggable={false} style={{ left: `${editorImagePosition.x}%`, top: `${editorImagePosition.y}%`, transform: 'translate(-50%, -50%)' }} onClick={() => setEditorImageSelected(true)} onPointerDown={editorImagePointerDown} onPointerUp={editorPagePointerUp} />}
-                      {editorImageSelected && editorImagePreview && <div className="editor-image-float-tools" style={{ left: `${Math.min(editorImagePosition.x, 78)}%`, top: `${Math.max(3, editorImagePosition.y - 7)}%` }} onPointerDown={(event) => event.stopPropagation()}>
-                        <button title="Crop image" aria-label="Open crop options" onClick={() => setEditorTool('text')}><Crop size={14} /></button>
-                        <button title="Rotate image 90 degrees" aria-label="Rotate image 90 degrees" onClick={() => setEditorImageRotation((rotation) => (rotation + 90) % 360)}><RotateCw size={14} /></button>
-                        <button title="Align image left" aria-label="Align image left" onClick={() => setEditorImagePosition((position) => ({ ...position, x: 18 }))}><AlignLeft size={14} /></button>
-                        <button title="Center image" aria-label="Center image" onClick={() => setEditorImagePosition((position) => ({ ...position, x: 50 }))}><AlignCenter size={14} /></button>
-                        <button title="Align image right" aria-label="Align image right" onClick={() => setEditorImagePosition((position) => ({ ...position, x: 82 }))}><AlignRight size={14} /></button>
-                        <button title="Remove image" aria-label="Remove image" onClick={() => { setEditorImageSource(''); setEditorImageSelected(false); }}><Trash2 size={14} /></button>
-                      </div>}
-                      <canvas className={`editor-page-drawing ${editorTool !== 'text' ? 'interactive' : ''}`} ref={drawingCanvasRef} aria-label="Drawing and highlighter canvas" onPointerDown={startEditorStroke} onPointerMove={continueEditorStroke} onPointerUp={endEditorStroke} onPointerCancel={endEditorStroke} onPointerLeave={endEditorStroke} style={{ pointerEvents: editorTool === 'text' ? 'none' : 'auto' }} />
-                    </div> : null}
-                    {!hasPdfCanvas && (pdfSourceUrl || pdfOutput?.file.type === 'application/pdf') && <iframe className="editor-pdf-frame" src={pdfOutput?.url || pdfSourceUrl} title="Preview of the selected PDF" />}
+                : hasPdfCanvas || (!pdfSourceUrl && !pdfOutput) ? <div className="editor-page" ref={editorPageRef} style={hasPdfCanvas ? { aspectRatio: `${pdfPageDimensions.width} / ${pdfPageDimensions.height}` } : undefined} onClick={(event) => { if (!(event.target instanceof Element) || !event.target.closest('.editor-page-photo, .editor-image-float-tools, .editor-image-resize-handle')) setEditorImageSelected(false); }} onPointerMove={editorPagePointerMove} onPointerUp={editorPagePointerUp} onPointerCancel={editorPagePointerUp}>
+                  {hasPdfCanvas && <img className="editor-page-pdf-bg" src={pdfPageImage} alt={`PDF page ${pdfPageNumber}`} draggable={false} />}
+                  <div
+                    ref={editorTextRef}
+                    className="editor-page-text"
+                    aria-label="Document text"
+                    role="textbox"
+                    aria-multiline="true"
+                    contentEditable={editorTool === 'text'}
+                    suppressContentEditableWarning
+                    spellCheck
+                    onInput={(event) => { pushEditorHistory(); setEditorText(event.currentTarget.innerHTML); }}
+                    onMouseUp={rememberEditorSelection}
+                    onKeyUp={rememberEditorSelection}
+                    style={{ pointerEvents: editorTool === 'text' ? 'auto' : 'none' }}
+                  />
+                  {editorImagePreview && <div className={`editor-image-frame ${editorImageSelected ? 'selected' : ''}`} style={{ left: `${editorImagePosition.x}%`, top: `${editorImagePosition.y}%`, width: `${editorImageSize.width}%`, height: `${editorImageSize.height}%`, transform: 'translate(-50%, -50%)' }}>
+                    <img className="editor-page-photo" src={editorImagePreview} alt={editorImageName || 'Inserted document image'} draggable={false} onLoad={editorImagePreviewLoaded} onClick={() => setEditorImageSelected(true)} onPointerDown={editorImagePointerDown} onPointerUp={editorPagePointerUp} />
+                    {editorImageSelected && <div className="editor-image-resize-handles" aria-label="Resize selected image">
+                      {([['nw', 'top left'], ['n', 'top centre'], ['ne', 'top right'], ['e', 'middle right'], ['se', 'bottom right'], ['s', 'bottom centre'], ['sw', 'bottom left'], ['w', 'middle left']] as const).map(([handle, label]) => <button key={handle} type="button" className={`editor-image-resize-handle handle-${handle}`} title={`Resize from ${label}`} aria-label={`Resize image from ${label}`} onPointerDown={(event) => editorImageResizeStart(event, handle)} onPointerMove={editorImageResizeMove} onPointerUp={editorImageResizeEnd} onPointerCancel={editorImageResizeEnd} />)}
+                    </div>}
+                  </div>}
+                  {editorImageSelected && editorImagePreview && <div className="editor-image-float-tools" style={{ left: `${Math.min(editorImagePosition.x, 78)}%`, top: `${Math.max(3, editorImagePosition.y - 7)}%` }} onPointerDown={(event) => event.stopPropagation()}>
+                    <button title="Crop image" aria-label="Open crop options" onClick={() => setEditorTool('text')}><Crop size={14} /></button>
+                    <button title="Rotate image 90 degrees" aria-label="Rotate image 90 degrees" onClick={() => setEditorImageRotation((rotation) => (rotation + 90) % 360)}><RotateCw size={14} /></button>
+                    <button title="Align image left" aria-label="Align image left" onClick={() => setEditorImagePosition((position) => ({ ...position, x: editorImageSize.width / 2 }))}><AlignLeft size={14} /></button>
+                    <button title="Center image" aria-label="Center image" onClick={() => setEditorImagePosition((position) => ({ ...position, x: 50 }))}><AlignCenter size={14} /></button>
+                    <button title="Align image right" aria-label="Align image right" onClick={() => setEditorImagePosition((position) => ({ ...position, x: 100 - editorImageSize.width / 2 }))}><AlignRight size={14} /></button>
+                    <button title="Remove image" aria-label="Remove image" onClick={() => { setEditorImageSource(''); setEditorImageSelected(false); }}><Trash2 size={14} /></button>
+                  </div>}
+                  <canvas className={`editor-page-drawing ${editorTool !== 'text' ? 'interactive' : ''}`} ref={drawingCanvasRef} aria-label="Drawing and highlighter canvas" onPointerDown={startEditorStroke} onPointerMove={continueEditorStroke} onPointerUp={endEditorStroke} onPointerCancel={endEditorStroke} onPointerLeave={endEditorStroke} style={{ pointerEvents: editorTool === 'text' ? 'none' : 'auto' }} />
+                </div> : null}
+              {!hasPdfCanvas && (pdfSourceUrl || pdfOutput?.file.type === 'application/pdf') && <iframe className="editor-pdf-frame" src={pdfOutput?.url || pdfSourceUrl} title="Preview of the selected PDF" />}
               {pdfBusy && <div className="pdf-processing-overlay" role="status" aria-live="polite">
                 <span className="pdf-processing-spinner"><RefreshCw className="spin" size={22} /></span>
                 <b>{pdfProcessingMessage || 'Preparing your document…'}</b>
@@ -2559,11 +3321,32 @@ export default function App() {
 
           <aside className="panel pdf-run-panel">
             <div className="section-title"><div><h2>{selectedAction.name}</h2><p>{selectedAction.description}</p></div></div>
-            <label className="file-drop" onClick={() => pdfFileInputRef.current?.click()}>
+            {pdfAction === 'merge' ? <section className="merge-pdf-uploader" aria-label="PDFs in merge order">
+              {pdfFiles.length > 0 && <>
+                <div className="merge-pdf-list-heading"><b>Files to merge</b><small>{pdfFiles.length} PDF{pdfFiles.length === 1 ? '' : 's'} · shown in merge order</small></div>
+                <ol className="merge-pdf-file-list">
+                  {pdfFiles.map((file, index) => <li className="merge-pdf-file-row" key={`${file.name}-${file.size}-${file.lastModified}-${index}`}>
+                    <span className="merge-pdf-index">{index + 1}</span>
+                    <span className="merge-pdf-file-name" title={file.name}>{file.name}<small>{formatSize(file.size)}</small></span>
+                    <div className="merge-pdf-file-actions">
+                      <button type="button" title="Move earlier" aria-label={`Move ${file.name} earlier`} disabled={index === 0} onClick={() => moveMergePdf(index, -1)}>↑</button>
+                      <button type="button" title="Move later" aria-label={`Move ${file.name} later`} disabled={index === pdfFiles.length - 1} onClick={() => moveMergePdf(index, 1)}>↓</button>
+                      <button type="button" className="remove-page-button" title="Remove PDF" aria-label={`Remove ${file.name}`} onClick={() => removeMergePdf(index)}><X size={14} /></button>
+                    </div>
+                  </li>)}
+                </ol>
+              </>}
+              <button type="button" className="file-drop merge-pdf-add" onClick={() => pdfFileInputRef.current?.click()}>
+                <UploadCloud size={20} />
+                <b>{pdfFiles.length ? '+ Insert Another PDF' : 'Choose First PDF'}</b>
+                <small>{pdfFiles.length ? 'Add one PDF at a time' : 'Select a PDF to start your merge'}</small>
+              </button>
+              {pdfFiles.length < 2 && <small className="merge-pdf-requirement">Add at least two PDFs to enable merging.</small>}
+            </section> : <label className="file-drop" onClick={() => pdfFileInputRef.current?.click()}>
               <UploadCloud size={22} />
-              <b>{pdfFiles.length ? pdfFiles.map((file) => file.name).join(', ') : pdfAction === 'merge' ? 'Choose two or more PDF files' : 'Choose a PDF file'}</b>
+              <b>{pdfFiles.length ? pdfFiles.map((file) => file.name).join(', ') : 'Choose a PDF file'}</b>
               <small>{pdfFiles.length ? `${pdfFiles.length} file${pdfFiles.length === 1 ? '' : 's'} selected` : 'PDF files only'}</small>
-            </label>
+            </label>}
             {editorPdfFile && <div className="editor-page-navigation">
               <button disabled={pdfRendering || pdfPageNumber <= 1} onClick={() => changePdfPage(pdfPageNumber - 1)}>Previous</button>
               <span>{pdfRendering ? 'Opening…' : `${pdfPageNumber} / ${pdfPageCount}`}</span>
@@ -2603,7 +3386,7 @@ export default function App() {
               </label>}
             </>}
             {pdfAction === 'flip' && <label className="field-label">Flip direction<select value={pdfFlipDirection} onChange={(event) => setPdfFlipDirection(event.target.value as 'horizontal' | 'vertical')}><option value="horizontal">Horizontal · mirror left to right</option><option value="vertical">Vertical · mirror top to bottom</option></select></label>}
-            <button className="primary full-button" disabled={pdfBusy || !token} onClick={() => void runPdfAction()}>{pdfBusy ? 'Working…' : 'Run operation'}</button>
+            <button className="primary full-button" disabled={pdfBusy || !token || (pdfAction === 'merge' && pdfFiles.length < 2)} onClick={() => void runPdfAction()}>{pdfBusy ? 'Working…' : 'Run operation'}</button>
             {!token && <p className="inline-hint">Sign in to run backend PDF operations.</p>}
             <hr className="editor-workspace-divider" />
             <div className="section-title"><div><h2>Page tools</h2><p>Type, mark up, and place a picture on your page.</p></div></div>
@@ -2619,10 +3402,10 @@ export default function App() {
             <input ref={imageFileInputRef} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={(event) => { void loadEditorImage(event.target.files?.[0]); event.target.value = ''; }} />
             {editorImagePreview && editorImageSelected && <>
               <p className="editor-file-note">Selected: {editorImageName}. Drag it on the page, or choose crop, rotate, and alignment options.</p>
-              <label className="editor-range-label">Crop left<input type="range" min="0" max={95-editorCropRight} value={editorCropLeft} onChange={(event) => setEditorCropLeft(Number(event.target.value))} /></label>
-              <label className="editor-range-label">Crop right<input type="range" min="0" max={95-editorCropLeft} value={editorCropRight} onChange={(event) => setEditorCropRight(Number(event.target.value))} /></label>
-              <label className="editor-range-label">Crop top<input type="range" min="0" max={95-editorCropBottom} value={editorCropTop} onChange={(event) => setEditorCropTop(Number(event.target.value))} /></label>
-              <label className="editor-range-label">Crop bottom<input type="range" min="0" max={95-editorCropTop} value={editorCropBottom} onChange={(event) => setEditorCropBottom(Number(event.target.value))} /></label>
+              <label className="editor-range-label">Crop left<input type="range" min="0" max={95 - editorCropRight} value={editorCropLeft} onChange={(event) => setEditorCropLeft(Number(event.target.value))} /></label>
+              <label className="editor-range-label">Crop right<input type="range" min="0" max={95 - editorCropLeft} value={editorCropRight} onChange={(event) => setEditorCropRight(Number(event.target.value))} /></label>
+              <label className="editor-range-label">Crop top<input type="range" min="0" max={95 - editorCropBottom} value={editorCropTop} onChange={(event) => setEditorCropTop(Number(event.target.value))} /></label>
+              <label className="editor-range-label">Crop bottom<input type="range" min="0" max={95 - editorCropTop} value={editorCropBottom} onChange={(event) => setEditorCropBottom(Number(event.target.value))} /></label>
               <div className="editor-tool-group">
                 <button onClick={() => setEditorImageRotation((rotation) => (rotation + 270) % 360)}><RotateCw size={14} /> Rotate left</button>
                 <button onClick={() => setEditorImageRotation((rotation) => (rotation + 90) % 360)}><RotateCw size={14} /> Rotate right</button>
@@ -3049,6 +3832,105 @@ export default function App() {
     );
   }
 
+  function renderAdminDashboard() {
+    if (!token || adminAccess === 'signed-out') {
+      return <>
+        <PageHeading eyebrow="ADMINISTRATION" title="Admin Dashboard" subtitle="Platform usage and user activity." />
+        <section className="panel admin-access-state"><ShieldCheck size={24} /><div><h2>Sign in required</h2><p>Sign in to verify administrator access.</p></div><button onClick={() => setPage('Account / Privacy')}>Go to sign in</button></section>
+      </>;
+    }
+    if (adminAccess === 'denied') {
+      return <>
+        <PageHeading eyebrow="ADMINISTRATION" title="Admin Dashboard" subtitle="Platform usage and user activity." />
+        <section className="panel admin-access-state" role="alert">
+          <ShieldCheck size={24} />
+          <div><h2>Access denied</h2><p>Your account does not have administrator access.</p></div>
+          <button onClick={() => setPage('Home / Workspace')}>Return to workspace</button>
+        </section>
+      </>;
+    }
+    if (adminAccess === 'checking' || adminAccess === 'unavailable') {
+      return <>
+        <PageHeading eyebrow="ADMINISTRATION" title="Admin Dashboard" subtitle="Platform usage and user activity." />
+        <section className="panel admin-access-state" role="status">
+          <ShieldCheck size={24} />
+          <div><h2>{adminAccess === 'checking' ? 'Verifying access…' : 'Could not verify access'}</h2><p>{adminAccess === 'checking' ? 'Checking your account with the administrator API.' : adminStatsError || 'Please try again.'}</p></div>
+          {adminAccess === 'unavailable' && <button onClick={() => setAdminRefreshVersion((version) => version + 1)}>Try again</button>}
+        </section>
+      </>;
+    }
+
+    const stats = adminStats;
+    const statCards = stats ? [
+      { label: 'Total Users', value: stats.total_users, icon: Users },
+      { label: 'Documents', value: stats.total_documents, icon: FileText },
+      { label: 'PDF Operations', value: stats.total_pdf_operations, icon: Combine },
+      { label: 'Translations', value: stats.total_translations, icon: Languages },
+      { label: 'AI Assistant Usage', value: stats.total_ai_usage, icon: Sparkles },
+    ] : [];
+    const pagination = (result: { total: number } | null, offset: number, setOffset: (offset: number) => void) => {
+      const total = result?.total ?? 0;
+      const first = total === 0 ? 0 : offset + 1;
+      const last = Math.min(offset + 10, total);
+      return <div className="admin-pagination">
+        <span>{first}–{last} of {total}</span>
+        <div>
+          <button aria-label="Previous page" disabled={offset <= 0 || adminDataBusy} onClick={() => setOffset(Math.max(0, offset - 10))}>Previous</button>
+          <button aria-label="Next page" disabled={offset + 10 >= total || adminDataBusy} onClick={() => setOffset(offset + 10)}>Next</button>
+        </div>
+      </div>;
+    };
+    const tableRows = (events: AdminActivity[], withEmail: boolean) => events.length ? <div className="admin-table-scroll"><table className="admin-table">
+      <thead><tr>{withEmail && <th>User</th>}<th>Action</th><th>Entity</th><th>Date and time</th></tr></thead>
+      <tbody>{events.map((event) => <tr key={event.id}>
+        {withEmail && <td>{event.user_email || `User ${event.user_id}`}</td>}
+        <td><span className="admin-action-tag">{event.action}</span></td>
+        <td>{event.entity_type}</td>
+        <td>{formatAdminTimestamp(event.created_at)}</td>
+      </tr>)}</tbody>
+    </table></div> : <div className="empty-state" role={adminDataBusy ? 'status' : undefined}>{adminDataBusy ? 'Loading activity…' : 'No activity to show yet.'}</div>;
+
+    return <>
+      <div className="admin-page-heading">
+        <PageHeading eyebrow="ADMINISTRATION" title="Admin Dashboard" subtitle="A clear view of platform usage and recent user activity." />
+        <button className="admin-refresh-button" disabled={adminDataBusy} onClick={() => setAdminRefreshVersion((version) => version + 1)}><RefreshCw size={15} /> Refresh</button>
+      </div>
+      {adminStatsError && <p className="admin-inline-error" role="alert">{adminStatsError}</p>}
+      {adminDataError && <p className="admin-inline-error" role="alert">{adminDataError}</p>}
+      <section className="admin-stat-grid" aria-label="Platform statistics">
+        {statCards.map(({ label, value, icon: Icon }) => <article className="admin-stat-card" key={label}>
+          <span><Icon size={18} /></span><div><small>{label}</small><b>{value.toLocaleString()}</b></div>
+        </article>)}
+        {!stats && <div className="empty-state">Statistics are temporarily unavailable.</div>}
+      </section>
+      {stats?.historical_activity_limited && <p className="admin-history-note">{stats.historical_activity_note}</p>}
+
+      <section className="panel admin-panel">
+        <div className="admin-section-heading"><div><span className="eyebrow">PLATFORM</span><h2>Recent activity</h2><p>Newest tracked events across user accounts.</p></div>{adminDataBusy && <small role="status">Refreshing…</small>}</div>
+        {tableRows(adminActivityPage?.items || [], true)}
+        {pagination(adminActivityPage, adminActivityOffset, setAdminActivityOffset)}
+      </section>
+
+      <section className="panel admin-panel">
+        <div className="admin-section-heading"><div><span className="eyebrow">ACCOUNTS</span><h2>Users</h2><p>Select a user to view their tracked activity.</p></div></div>
+        {adminUsersPage?.items.length ? <div className="admin-table-scroll"><table className="admin-table admin-users-table">
+          <thead><tr><th>User ID</th><th>Email</th><th>Activity</th></tr></thead>
+          <tbody>{adminUsersPage.items.map((adminUser) => <tr key={adminUser.id} className={selectedAdminUser?.id === adminUser.id ? 'selected' : ''}>
+            <td>{adminUser.id}</td><td>{adminUser.email}</td>
+            <td><button className="admin-view-user" onClick={() => { setSelectedAdminUser(adminUser); setAdminUserActivityOffset(0); setAdminUserActivityPage(null); }}>View activity <ChevronDown size={14} /></button></td>
+          </tr>)}</tbody>
+        </table></div> : <div className="empty-state" role={adminDataBusy ? 'status' : undefined}>{adminDataBusy ? 'Loading users…' : 'No users to show.'}</div>}
+        {pagination(adminUsersPage, adminUsersOffset, setAdminUsersOffset)}
+      </section>
+
+      {selectedAdminUser && <section className="panel admin-panel admin-user-history">
+        <div className="admin-section-heading"><div><span className="eyebrow">USER HISTORY</span><h2>{selectedAdminUser.email}</h2><p>Activity for user ID {selectedAdminUser.id}.</p></div><button onClick={() => { setSelectedAdminUser(null); setAdminUserActivityPage(null); }}>Close</button></div>
+        {tableRows(adminUserActivityPage?.items || [], false)}
+        {pagination(adminUserActivityPage, adminUserActivityOffset, setAdminUserActivityOffset)}
+      </section>}
+    </>;
+  }
+
   function renderPage() {
     switch (page) {
       case 'Home / Workspace':
@@ -3062,6 +3944,14 @@ export default function App() {
                 <div className="welcome-actions">
                   <label className="primary button-label"><UploadCloud size={17} /> Upload a document<input type="file" onChange={(event) => { void uploadDocument(event.target.files?.[0]); event.target.value = ''; }} /></label>
                   <button onClick={() => setPage('PDF Studio')}>Open PDF Studio <ChevronDown className="chevron-side" size={16} /></button>
+                  <button onClick={() => {
+                    resetEditor();
+                    setEditorImagePreview('');
+                    setPdfPageImage('');
+                    setPdfSourceUrl('');
+                    setPdfAction('info');
+                    setPage('PDF Studio');
+                  }}><FilePlus2 size={16} /> Blank Document</button>
                 </div>
               </div>
               <div className="welcome-art" aria-hidden="true"><span>{companion.emoji}</span><small>Here to help</small></div>
@@ -3090,89 +3980,265 @@ export default function App() {
         return renderTemplates();
       case 'Document History':
         return renderDocumentHistory();
+      case 'Admin Dashboard':
+        return renderAdminDashboard();
       case 'AI Documents':
         return renderAiDocuments();
       case 'Language Bridge':
         return (
           <>
-            <PageHeading eyebrow="LANGUAGE BRIDGE" title="Translate your way" subtitle="Write in any supported language or upload a document, then choose the language you want." />
-            <section className="panel translation-panel">
-              <div className="translation-language-row">
-                <label className="field-label">From
-                  <select value={translationSource} onChange={(event) => { setTranslationSource(event.target.value); setTranslationResult(''); setTranslationOutput(null); setTranslationMessage(''); }}>
-                    <option value="auto">Detect language</option>
-                    {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
-                  </select>
+            <PageHeading eyebrow="LANGUAGE BRIDGE" title="Language Bridge" subtitle="Translate, edit and compare Tamil and English documents." />
+            <div className="language-bridge-page">
+              <section className="panel language-bridge-upload-card">
+                <h3>Upload Document</h3>
+                <p>Upload your document to begin the translation process.</p>
+                <label className="language-bridge-dropzone">
+                  <UploadCloud size={22} />
+                  <span>{translationFile ? translationFile.name : 'Choose a document'}</span>
+                  <small>PDF, DOCX or TXT · Maximum 20 MB</small>
+                  <input type="file" accept={AI_READABLE_ACCEPT} onChange={(event) => { const file = event.target.files?.[0] ?? null; setTranslationFile(file); setTranslationSource('auto'); setTranslationSourceLocked(false); setTranslationText(''); setTranslationResult(''); setTranslationRevised(''); setTranslationOutput(null); setTranslationMessage(''); event.target.value = ''; if (file) void extractBridgeText(file); }} />
                 </label>
-                <ArrowLeftRight className="translation-arrow" size={18} />
-                <label className="field-label">To
-                  <select value={translationTarget} onChange={(event) => { setTranslationTarget(event.target.value); setTranslationResult(''); setTranslationOutput(null); setTranslationMessage(''); }}>
-                    {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
-                  </select>
-                </label>
+              </section>
+
+              <section className="panel language-bridge-settings">
+                <div className="language-bridge-setting-row">
+                  <label className="field-label">Source Language
+                    <select value={translationSource} onChange={(event) => { setTranslationSource(event.target.value); setTranslationSourceLocked(event.target.value !== 'auto'); setTranslationResult(''); setTranslationRevised(''); setTranslationOutput(null); setTranslationMessage(''); }}>
+                      <option value="auto">Detect language</option>
+                      {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+                    </select>
+                  </label>
+                  <div className="language-bridge-arrow-wrap" aria-hidden="true"><ArrowLeftRight size={18} /></div>
+                  <label className="field-label">Target Language
+                    <select value={translationTarget} onChange={(event) => { setTranslationTarget(event.target.value); setTranslationResult(''); setTranslationRevised(''); setTranslationOutput(null); setTranslationMessage(''); }}>
+                      {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+                    </select>
+                  </label>
+                </div>
+              </section>
+
+              <div className="language-bridge-output-row">
+                <article className="panel language-bridge-output-card">
+                  <div className="language-bridge-card-header">
+                    <h4>Original {languages.find(([code]) => code === translationSource)?.[1] ?? 'Text'}</h4>
+                    <button type="button" className="language-bridge-download-button" disabled={!translationText.trim()} onClick={() => downloadBridgeText('original-text.txt', translationText)}><Download size={14} /> Download</button>
+                  </div>
+                  <textarea className="language-bridge-editor" aria-label="Original text" value={translationText} onChange={(event) => { const text = event.target.value; translationFileLoadId.current += 1; setTranslationExtractBusy(false); setTranslationText(text); setTranslationFile(null); if (!translationSourceLocked) setTranslationSource(detectBridgeLanguage(text) ?? 'auto'); setTranslationResult(''); setTranslationRevised(''); setTranslationOutput(null); setTranslationMessage(''); }} maxLength={20000} placeholder={translationFile ? `Extracting text from ${translationFile.name}…` : 'Type or paste the original text here…'} />
+                </article>
+
+                <article className="panel language-bridge-output-card">
+                  <div className="language-bridge-card-header">
+                    <h4>{languages.find(([code]) => code === translationTarget)?.[1] ?? 'Translation'}</h4>
+                    <button type="button" className="language-bridge-download-button" disabled={!translationResult.trim()} onClick={() => downloadBridgeText('translated-text.txt', translationResult)}><Download size={14} /> Download</button>
+                  </div>
+                  <textarea className="language-bridge-editor" aria-label="Translated text" value={translationResult} onChange={(event) => { setTranslationResult(event.target.value); setTranslationRevised(''); setTranslationMessage(''); }} maxLength={20000} placeholder="Translation will appear here. You can edit it before translating it back." />
+                </article>
               </div>
-              <label className="field-label translation-input-label">Text to translate
-                <textarea value={translationText} onChange={(event) => { setTranslationText(event.target.value); setTranslationFile(null); setTranslationResult(''); setTranslationOutput(null); setTranslationMessage(''); }} maxLength={20000} placeholder="Type or paste text in any language…" />
-              </label>
-              <div className="translation-or">or upload a document</div>
-              <label className="file-drop translation-file">
-                <UploadCloud size={21} />
-                <b>{translationFile ? translationFile.name : 'Choose a PDF, DOCX, TXT, or Markdown file'}</b>
-                <small>We extract text and translate it. Max 20,000 characters.</small>
-                <input type="file" accept=".pdf,.docx,.txt,.md,application/pdf,text/plain" onChange={(event) => { setTranslationFile(event.target.files?.[0] ?? null); setTranslationText(''); setTranslationResult(''); setTranslationOutput(null); setTranslationMessage(''); event.target.value = ''; }} />
-              </label>
-              <div className="translation-actions">
-                <span>13 targets, including Tanglish</span>
-                <button className="primary" disabled={translationBusy} onClick={() => void runTranslation()}>{translationBusy ? (translationFile ? 'Translating file sections…' : 'Translating…') : 'Translate'}</button>
+
+              <div className="language-bridge-action-row">
+                <button type="button" className="language-bridge-primary-action" disabled={translationBusy || translationExtractBusy || (!translationText.trim() && !translationFile)} onClick={() => void runTranslation()}>
+                  {translationBusy ? 'Translating…' : `Translate to ${languages.find(([code]) => code === translationTarget)?.[1] ?? 'target language'}`} <ArrowLeftRight size={15} />
+                </button>
+                <button type="button" className="language-bridge-primary-action" disabled={translationBusy || !translationResult.trim() || (translationSource === 'auto' && !detectBridgeLanguage(translationText))} onClick={() => void runTranslation(translationResult, translationTarget, translationSource === 'auto' ? detectBridgeLanguage(translationText) ?? 'auto' : translationSource, true)}>
+                  Translate edited version back to {languages.find(([code]) => code === translationSource)?.[1] ?? 'source language'} <ArrowLeftRight size={15} />
+                </button>
               </div>
+
+              <section className="panel language-bridge-revised-card">
+                <div className="language-bridge-card-header">
+                  <h3>Revised {languages.find(([code]) => code === translationSource)?.[1] ?? 'Text'}</h3>
+                  <button type="button" className="language-bridge-download-button" disabled={!translationRevised.trim()} onClick={() => downloadBridgeText('revised-text.txt', translationRevised)}><Download size={14} /> Download</button>
+                </div>
+                <textarea className="language-bridge-editor language-bridge-revised-editor" aria-label="Revised translation" value={translationRevised} onChange={(event) => setTranslationRevised(event.target.value)} maxLength={20000} placeholder="The revised translation will appear here after you translate your edited version back." />
+                <div className="language-bridge-decision-row">
+                  <button type="button" className="language-bridge-accept-button" disabled={!translationRevised.trim()} onClick={() => { setTranslationText(translationRevised); setTranslationResult(''); setTranslationRevised(''); setTranslationMessage('Revised translation accepted as the original text.'); }}><Check size={14} /> Accept Changes</button>
+                  <button type="button" className="language-bridge-reject-button" disabled={!translationRevised.trim()} onClick={() => { setTranslationRevised(''); setTranslationMessage('Revised translation rejected.'); }}><X size={14} /> Reject Changes</button>
+                </div>
+              </section>
+
+              <div className="language-bridge-notice">
+                <span className="language-bridge-notice-icon"><CircleAlert size={18} /></span>
+                <div>
+                  <strong>Important Document Notice</strong>
+                  <p>For legal, financial and official documents, always verify the translated content before using it.</p>
+                </div>
+              </div>
+
               {translationBusy && translationFile && <p className="translation-progress" role="status">Reading and translating the document in shorter sections. You can stay on this page while it finishes.</p>}
-              {translationResult && <section className="translation-result"><b>{translationFile ? 'Translated document' : 'Translation'}</b><pre>{translationResult}</pre></section>}
               {translationOutput && <div className="translation-output-actions">
                 <button className="primary" onClick={downloadTranslationOutput}><Download size={15} /> Download translated file</button>
                 <button disabled={!token || translationSaveBusy} onClick={() => void saveTranslationOutput()}><Save size={15} /> {translationSaveBusy ? 'Saving…' : 'Save to Document History'}</button>
                 <button className="discard-button" onClick={clearTranslationOutput}><Trash2 size={15} /> Delete result</button>
               </div>}
               {translationMessage && <p className="operation-notice" role="status">{translationMessage}</p>}
-              {!token && <p className="inline-hint">Sign in and configure an LLM_API_KEY in the backend to translate.</p>}
-            </section>
+              {!token && <p className="inline-hint">Sign in to translate your documents.</p>}
+            </div>
+          </>
+        );
+      case 'Humanizer':
+        return (
+          <>
+            <div className="humanizer-page">
+              <section className="humanizer-hero">
+                <span className="humanizer-hero-icon"><Sparkles size={26} /></span>
+                <div>
+                  <h1>AI Humanizer</h1>
+                  <p>Make your AI-generated or formal text sound natural and human-like.</p>
+                </div>
+                <span className="humanizer-support"><Check size={14} /> Supports Files &amp; Text</span>
+              </section>
+
+              <section className="humanizer-source-panel">
+                <label className={`humanizer-upload-zone ${humanizerFileBusy ? 'loading' : ''}`}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => { event.preventDefault(); const file = event.dataTransfer.files[0]; if (file) void loadHumanizerFile(file); }}>
+                  <UploadCloud size={48} />
+                  <span className="humanizer-upload-copy">
+                    <b>{humanizerFile?.name || 'Upload your document'}</b>
+                    <small>{humanizerFileBusy ? 'Extracting text…' : 'Drag and drop or browse files'}</small>
+                    <span className="humanizer-file-types"><i>PDF</i><i>DOCX</i><i>TXT</i></span>
+                  </span>
+                  <input type="file" accept=".pdf,.docx,.txt,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void loadHumanizerFile(file); }} />
+                </label>
+                <label className="humanizer-paste-area">Or paste your text
+                  <small>Alternative input</small>
+                  <textarea value={humanizerInput} onChange={(event) => { humanizerFileRequestId.current += 1; setHumanizerFileBusy(false); setHumanizerFile(null); setHumanizerInput(event.target.value); setHumanizerOutput(''); setHumanizerError(''); setHumanizerNotice(''); }} maxLength={20000} placeholder="Paste content here…" />
+                </label>
+              </section>
+
+              <section className="humanizer-options">
+                <div className="humanizer-style-select">
+                  <b><Sparkles size={16} /> Writing Style:</b>
+                  <div className="humanizer-style-buttons" role="group" aria-label="Writing style">
+                    {([
+                      ['simple', 'Simple', Sparkles],
+                      ['professional', 'Professional', ShieldCheck],
+                      ['conversational', 'Conversational', MessageCircle],
+                      ['academic', 'Academic', BookOpen],
+                    ] as const).map(([style, label, Icon]) => (
+                      <button type="button" className={humanizerWritingStyle === style ? 'active' : ''} aria-pressed={humanizerWritingStyle === style} key={style} onClick={() => setHumanizerWritingStyle(style)}>
+                        <Icon size={14} /> {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <label className="humanizer-strength">
+                  <b><Settings2 size={16} /> Humanization Strength:</b>
+                  <input type="range" min="1" max="5" step="1" value={humanizerStrength} aria-label="Humanization strength" onChange={(event) => setHumanizerStrength(Number(event.target.value))} />
+                  <span><small>Light Editing</small><small>Deep Rewriting</small></span>
+                </label>
+                <button className="humanizer-run-button" disabled={humanizerBusy || humanizerFileBusy || !humanizerInput.trim()} onClick={() => void runHumanizer()}>
+                  <Sparkles size={17} /> {humanizerBusy ? 'Humanizing…' : 'Humanize Document'}
+                </button>
+              </section>
+
+              <section className="humanizer-results">
+                <article className="humanizer-result-card">
+                  <header>
+                    <b><FileText size={17} /> Original Text</b>
+                    <span>Word Count: {countWords(humanizerInput)}</span>
+                  </header>
+                  <div className="humanizer-result-content">{humanizerInput || 'Your original text will appear here.'}</div>
+                </article>
+                <span className="humanizer-result-arrow" aria-hidden="true"><ArrowLeftRight size={25} /></span>
+                <article className="humanizer-result-card humanizer-result-success">
+                  <header>
+                    <b><Check size={17} /> Humanized Result</b>
+                    <span>Word Count: {countWords(humanizerOutput)}</span>
+                  </header>
+                  <div className="humanizer-result-content">{humanizerOutput || 'Your humanized text will appear here.'}</div>
+                </article>
+              </section>
+
+              <section className="humanizer-actions">
+                <div className="humanizer-action-buttons">
+                  <b>You can now:</b>
+                  <button type="button" disabled={!humanizerOutput.trim()} onClick={() => void copyHumanizerOutput()}><Copy size={16} /> Copy Text</button>
+                  <div className="humanizer-download-control">
+                    <Download size={16} />
+                    <select aria-label="Download format" value={humanizerDownloadFormat} disabled={!humanizerOutput.trim()} onChange={(event) => setHumanizerDownloadFormat(event.target.value as 'txt' | 'docx' | 'pdf')}>
+                      <option value="txt">Download as TXT</option>
+                      <option value="docx">Download as DOCX</option>
+                      <option value="pdf">Download as PDF</option>
+                    </select>
+                    <button type="button" disabled={!humanizerOutput.trim()} aria-label="Download humanized result" onClick={() => void downloadHumanizerOutput()}><ArrowDownToLine size={15} /></button>
+                  </div>
+                  <button type="button" disabled={humanizerBusy || humanizerFileBusy} onClick={resetHumanizer}><RefreshCw size={15} /> Start Over</button>
+                </div>
+                <p><CircleAlert size={16} /> Your meaning is preserved while making the text more natural and easy to read.</p>
+              </section>
+
+              {humanizerError && <p className="ai-error" role="alert">{humanizerError}</p>}
+              {humanizerNotice && <p className="operation-notice" role="status">{humanizerNotice}</p>}
+              {!token && <p className="inline-hint">Sign in to use Humanizer.</p>}
+            </div>
+          </>
+        );
+      case 'Settings':
+        return (
+          <>
+            <PageHeading eyebrow="SETTINGS" title="Settings" subtitle="Manage your account, workspace appearance, and information about JM Vertex." />
+            <div className="settings-options-grid">
+              <section className="panel settings-option-card">
+                <span className="settings-option-icon"><UserRound size={20} /></span>
+                <h2>Profile / Account settings</h2>
+                <p>Manage your profile, sign-in details, privacy, and account security.</p>
+                {user && <small>Signed in as {user.email}</small>}
+                <button onClick={() => setPage('Account / Privacy')}>Open account settings <ChevronDown size={15} /></button>
+              </section>
+              <section className="panel settings-option-card">
+                <span className="settings-option-icon"><Settings2 size={20} /></span>
+                <h2>Theme</h2>
+                <p>Choose your workspace colour palette, light or dark mode, and assistant companion.</p>
+                <small>Current theme: {palettes.find((item) => item.id === paletteId)?.name ?? paletteId} · {themeMode}</small>
+                <button onClick={() => setPage('Companion & Themes')}>Choose theme <ChevronDown size={15} /></button>
+              </section>
+              <section className="panel settings-option-card">
+                <span className="settings-option-icon"><FileText size={20} /></span>
+                <h2>About JM Vertex</h2>
+                <p>Learn about JM Vertex Technologies and the Vertex Docs workspace.</p>
+                <button onClick={() => setPage('About JM Vertex')}>About JM Vertex <ChevronDown size={15} /></button>
+              </section>
+            </div>
           </>
         );
       case 'Account / Privacy':
         return (
           <>
+            <button className="settings-back-button" onClick={() => setPage('Settings')}><ArrowLeftRight size={14} /> Settings</button>
             <PageHeading eyebrow="ACCOUNT & PRIVACY" title={user ? 'Account & security' : 'Sign in to your workspace'} subtitle={user ? 'Your identity, session and document privacy in one place.' : 'Create a personal account or sign in to return to your private workspace.'} />
             {user ? <div className="account-page-content">
               <section className="panel account-profile-card">
                 <div className="account-profile-avatar">{companion.emoji}</div>
                 <div className="account-profile-info"><span className="eyebrow">PERSONAL ACCOUNT</span><h2>{user.name}</h2><p>{user.email}</p></div>
-                <span className="account-active-badge"><Check size={14}/> Active</span>
-                <button className="account-signout" onClick={signOut}><LogOut size={16}/>Sign out</button>
+                <span className="account-active-badge"><Check size={14} /> Active</span>
+                <button className="account-signout" onClick={signOut}><LogOut size={16} />Sign out</button>
               </section>
               <div className="account-security-grid">
-                <section className="panel account-security-card"><span className="account-security-icon"><ShieldCheck size={19}/></span><h3>Your documents are private</h3><p>Files in your workspace are linked to your account. Other signed-in users cannot list, download, or delete them.</p><small>{documents.length} {documents.length===1?'document':'documents'} in your workspace</small></section>
-                <section className="panel account-security-card"><span className="account-security-icon"><LockKeyhole size={19}/></span><h3>Sign-in stays personal</h3><p>Use your own email and password. Sign out on shared devices; your account and saved files remain available when you sign in again.</p><small>Signed in as {user.email}</small></section>
-                <section className="panel account-security-card"><span className="account-security-icon"><Settings2 size={19}/></span><h3>Workspace preferences</h3><p>Your theme, assistant language, and companion are saved to your account.</p><button onClick={()=>setPage('Companion & Themes')}>Manage appearance <ChevronDown className="chevron-side" size={14}/></button></section>
-                <section className="panel account-security-card"><span className="account-security-icon"><Sparkles size={19}/></span><h3>AI document processing</h3><p>AI features send the selected document text to the provider configured by this workspace. They require the administrator’s API configuration.</p><small>AI is only used when you request a summary, chat, or translation.</small></section>
+                <section className="panel account-security-card"><span className="account-security-icon"><ShieldCheck size={19} /></span><h3>Your documents are private</h3><p>Files in your workspace are linked to your account. Other signed-in users cannot list, download, or delete them.</p><small>{documents.length} {documents.length === 1 ? 'document' : 'documents'} in your workspace</small></section>
+                <section className="panel account-security-card"><span className="account-security-icon"><LockKeyhole size={19} /></span><h3>Sign-in stays personal</h3><p>Use your own email and password. Sign out on shared devices; your account and saved files remain available when you sign in again.</p><small>Signed in as {user.email}</small></section>
+                <section className="panel account-security-card"><span className="account-security-icon"><Settings2 size={19} /></span><h3>Workspace preferences</h3><p>Your theme, assistant language, and companion are saved to your account.</p><button onClick={() => setPage('Companion & Themes')}>Manage appearance <ChevronDown className="chevron-side" size={14} /></button></section>
+                <section className="panel account-security-card"><span className="account-security-icon"><Sparkles size={19} /></span><h3>AI document processing</h3><p>AI features send the selected document text to the provider configured by this workspace. They require the administrator’s API configuration.</p><small>AI is only used when you request a summary, chat, or translation.</small></section>
               </div>
             </div> : <div className="auth-page-layout">
               <section className="auth-welcome-card">
-                <span className="auth-welcome-icon"><ShieldCheck size={23}/></span>
+                <span className="auth-welcome-icon"><ShieldCheck size={23} /></span>
                 <span className="eyebrow">YOUR PRIVATE WORKSPACE</span>
                 <h2>Pick up right where you left off.</h2>
                 <p>Your uploaded documents and saved preferences are tied to your account—not to a temporary browser session.</p>
-                <div className="auth-benefit"><Check size={15}/><span>Sign in again to find your files and settings</span></div>
-                <div className="auth-benefit"><Check size={15}/><span>Every account sees only its own documents</span></div>
-                <div className="auth-benefit"><Check size={15}/><span>Use any valid email when creating your account</span></div>
+                <div className="auth-benefit"><Check size={15} /><span>Sign in again to find your files and settings</span></div>
+                <div className="auth-benefit"><Check size={15} /><span>Every account sees only its own documents</span></div>
+                <div className="auth-benefit"><Check size={15} /><span>Use any valid email when creating your account</span></div>
               </section>
-              <form className="auth-panel panel" onSubmit={(event)=>{event.preventDefault();void submitAuth();}}>
+              <form className="auth-panel panel" onSubmit={(event) => { event.preventDefault(); void submitAuth(); }}>
                 <div className="auth-tabs"><button type="button" className={authMode === 'login' ? 'active' : ''} onClick={() => { setAuthMode('login'); setNotice(''); }}>Sign in</button><button type="button" className={authMode === 'signup' ? 'active' : ''} onClick={() => { setAuthMode('signup'); setNotice(''); }}>Create account</button></div>
-                <div><h2 className="auth-form-title">{authMode==='signup'?'Create your account':'Welcome back'}</h2><p className="auth-form-subtitle">{authMode==='signup'?'Use any valid email address and create a password.':'Use the email and password you registered with.'}</p></div>
+                <div><h2 className="auth-form-title">{authMode === 'signup' ? 'Create your account' : 'Welcome back'}</h2><p className="auth-form-subtitle">{authMode === 'signup' ? 'Use any valid email address and create a password.' : 'Use the email and password you registered with.'}</p></div>
                 {authMode === 'signup' && <label className="field-label">Name<input required minLength={2} maxLength={120} value={name} onChange={(event) => setName(event.target.value)} autoComplete="name" placeholder="Your name" /></label>}
                 <label className="field-label">Email address<input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" placeholder="you@example.com" /></label>
                 <label className="field-label">Password<input required minLength={8} maxLength={128} type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} placeholder="At least 8 characters" /></label>
                 <button className="primary full-button" type="submit">{authMode === 'signup' ? 'Create account' : 'Sign in securely'}</button>
                 {notice && <p className="inline-hint" role="status">{notice}</p>}
-                <small className="auth-footnote"><LockKeyhole size={13}/> Passwords are stored as secure hashes, never as plain text.</small>
+                <small className="auth-footnote"><LockKeyhole size={13} /> Passwords are stored as secure hashes, never as plain text.</small>
               </form>
             </div>}
           </>
@@ -3180,6 +4246,7 @@ export default function App() {
       case 'Companion & Themes':
         return (
           <>
+            <button className="settings-back-button" onClick={() => setPage('Settings')}><ArrowLeftRight size={14} /> Settings</button>
             <PageHeading eyebrow="MAKE VERTEX YOURS" title="Companion & appearance" subtitle="Choose your animated companion and give your workspace a colour palette that feels right." />
             <div className="appearance-grid">
               <section className="panel companion-panel">
@@ -3217,18 +4284,124 @@ export default function App() {
             </div>
           </>
         );
+      case 'About JM Vertex':
+        return (
+          <>
+            <button className="settings-back-button" onClick={() => setPage('Settings')}><ArrowLeftRight size={14} /> Settings</button>
+            <div className="about-jm-page">
+              <section className="about-jm-hero">
+                <div className="about-jm-brand"><img src="/jm-logo.png" alt="JM Vertex Technologies logo" /></div>
+                <div className="about-jm-hero-copy">
+                  <span className="eyebrow">ABOUT THE COMPANY</span>
+                  <h1>JM Vertex Technologies</h1>
+                  <p className="about-jm-tagline">Learn. Build. Grow.</p>
+                  <p>Empowering students and businesses across India.</p>
+                  <a href="https://jmvertextechnologies.com/" target="_blank" rel="noreferrer">Visit jmvertextechnologies.com <ArrowDownToLine size={14} /></a>
+                </div>
+                <span className="about-jm-location"><FileSearch size={15} /> Pollachi, Tamil Nadu, India</span>
+              </section>
+
+              <section className="about-jm-section">
+                <div className="about-jm-section-heading"><span className="eyebrow">WHO WE ARE</span><h2>Bridging learning and industry</h2></div>
+                <div className="about-jm-overview-grid">
+                  <article className="panel about-jm-mission">
+                    <h3>Our mission</h3>
+                    <p>To bridge the gap between academic learning and industry demands through practical technology training, internships, custom website development, foreign language courses, and end-to-end project building.</p>
+                  </article>
+                  <article className="panel about-jm-founders">
+                    <h3>Our founders</h3>
+                    <div><b>Joshua J</b><span>Founder</span></div>
+                    <div><b>Madhav Adithya S</b><span>Co-Founder</span></div>
+                  </article>
+                </div>
+              </section>
+
+              <section className="about-jm-section">
+                <div className="about-jm-section-heading"><span className="eyebrow">WHAT WE DO</span><h2>Core services</h2><p>Practical programs and technology services designed around real-world outcomes.</p></div>
+                <div className="about-jm-services-grid">
+                  <article className="panel about-jm-service-card">
+                    <span className="about-jm-card-icon"><Sparkles size={19} /></span>
+                    <h3>Training &amp; Internships</h3>
+                    <p>Mentor-led, industry-focused programs lasting 4–8 weeks, with hands-on projects and verified certificates.</p>
+                    <ul>
+                      <li><b>Python:</b> Core Python, data structures, OOP, CLI apps, automation, and data analysis.</li>
+                      <li><b>Web Development:</b> HTML, CSS, JavaScript, React, portfolio sites, and e-commerce UIs.</li>
+                      <li><b>AI:</b> ML fundamentals, neural networks, predictive models, chatbots, and image classifiers.</li>
+                      <li><b>Cloud Computing:</b> AWS/GCP basics, serverless functions, hosting, and cloud databases.</li>
+                      <li><b>Cybersecurity:</b> Network security, ethical hacking, vulnerability scanners, and secure auth.</li>
+                    </ul>
+                    <div className="about-jm-course-links">
+                      <a href="https://jmvertextechnologies.com/python-training" target="_blank" rel="noreferrer">Python course</a>
+                      <a href="https://jmvertextechnologies.com/full-stack-training" target="_blank" rel="noreferrer">Web development</a>
+                      <a href="https://jmvertextechnologies.com/ai-training" target="_blank" rel="noreferrer">AI course</a>
+                      <a href="https://jmvertextechnologies.com/cloud-computing-training" target="_blank" rel="noreferrer">Cloud course</a>
+                      <a href="https://jmvertextechnologies.com/cybersecurity-training" target="_blank" rel="noreferrer">Cybersecurity</a>
+                    </div>
+                  </article>
+
+                  <article className="panel about-jm-service-card">
+                    <span className="about-jm-card-icon"><FileText size={19} /></span>
+                    <h3>Website Development</h3>
+                    <p>Fast, modern websites for small businesses, startups, and personal brands—from landing pages to full web applications.</p>
+                    <ol className="about-jm-process">
+                      <li>Consultation &amp; requirements</li><li>UI/UX design &amp; prototyping</li>
+                      <li>Frontend &amp; backend development</li><li>Testing &amp; quality assurance</li><li>Deployment &amp; domain setup</li>
+                    </ol>
+                    <div className="about-jm-featured-project">
+                      <b>Featured project</b>
+                      <p><a href="https://pizzacrave.in/" target="_blank" rel="noreferrer">Pizza Crave <ArrowDownToLine size={12} /></a> — restaurant website with a dynamic video hero carousel, interactive menu, and direct WhatsApp ordering.</p>
+                    </div>
+                  </article>
+
+                  <article className="panel about-jm-service-card">
+                    <span className="about-jm-card-icon"><Languages size={19} /></span>
+                    <h3>Foreign Language Training</h3>
+                    <p>Online and offline classes, flexible timings, beginner-to-advanced learning, and verified certificates.</p>
+                    <div className="about-jm-language-group">
+                      <h4>German</h4>
+                      <ul><li><b>A1 · 8 weeks:</b> Basic vocabulary, simple sentences, and everyday conversations.</li><li><b>A2 · 8 weeks:</b> Complex sentences, past/future tenses, and routine tasks.</li><li><b>B1 · 10 weeks:</b> Independent use, opinions, and preparation for study or work in Germany.</li></ul>
+                    </div>
+                    <div className="about-jm-language-group">
+                      <h4>Japanese</h4>
+                      <ul><li><b>Basic · 6 weeks:</b> Hiragana, Katakana, and basic conversation.</li><li><b>JLPT N5 · 10 weeks:</b> Basic grammar, around 100 Kanji, and daily communication.</li><li><b>JLPT N4 · 12 weeks:</b> Advanced vocabulary, complex grammar, and around 300 Kanji.</li></ul>
+                    </div>
+                  </article>
+
+                  <article className="panel about-jm-service-card">
+                    <span className="about-jm-card-icon"><Settings2 size={19} /></span>
+                    <h3>Custom Project Building</h3>
+                    <p>End-to-end support for first-year mini-projects, final-year capstones, and startup MVPs.</p>
+                    <h4>Project domains</h4>
+                    <ul><li>Full-stack web apps: React, Node.js, Python, and PHP.</li><li>AI/ML: Computer vision and natural language processing.</li><li>Mobile apps: React Native and Flutter.</li><li>Cloud infrastructure: AWS and GCP.</li></ul>
+                    <div className="about-jm-deliverables"><b>Deliverables</b><span>Source code</span><span>Project reports</span><span>Architecture design</span><span>Deployment</span><span>Documentation support</span></div>
+                  </article>
+                </div>
+              </section>
+
+              <section className="about-jm-contact">
+                <div><span className="eyebrow">GET IN TOUCH</span><h2>Contact JM Vertex Technologies</h2><p>Monday–Saturday, 9:00 AM–6:00 PM · Sunday closed</p></div>
+                <div className="about-jm-contact-links">
+                  <a href="mailto:jmvertextechnologies2025@gmail.com"><b>Email</b><span>jmvertextechnologies2025@gmail.com</span></a>
+                  <a href="tel:+919092737477"><b>Phone</b><span>+91 90927 37477</span></a>
+                  <a href="tel:+919345699376"><b>Phone</b><span>+91 93456 99376</span></a>
+                  <a href="https://jmvertextechnologies.com/" target="_blank" rel="noreferrer"><b>Website</b><span>jmvertextechnologies.com</span></a>
+                </div>
+              </section>
+            </div>
+          </>
+        );
     }
   }
+
+  const settingsPages: PageName[] = ['Settings', 'Account / Privacy', 'Companion & Themes', 'About JM Vertex'];
 
   return (
     <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
       <header className="topbar">
         <button className="icon-button menu-button" aria-label="Toggle navigation" onClick={() => setSidebarOpen((open) => !open)}><Menu size={19} /></button>
         <button className="brand" onClick={() => setPage('Home / Workspace')}><span className="brand-mark"><img src="/jm-logo.png" alt="JM logo" /></span><span><b>Vertex Docs</b><small>JM Vertex Technologies</small></span></button>
-        <div className="top-search"><Search size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') setPage('Convert'); }} placeholder="Search documents, tools or features..." /></div>
         <div className="top-actions">
           <button className="icon-button" aria-label="Appearance settings" onClick={() => setPage('Companion & Themes')}>{themeMode === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button>
-          <button className="icon-button notification-button" aria-label="Notifications" onClick={() => setNotice(token ? 'You are all caught up.' : 'Sign in to see account notifications.')}><Bell size={18} /></button>
           {user ? (
             <button className="profile-button" onClick={() => setPage('Account / Privacy')}><span>{user.name.slice(0, 1).toUpperCase()}</span><b>{user.name}</b><ChevronDown size={15} /></button>
           ) : <button className="profile-button" onClick={() => setPage('Account / Privacy')}><span><UserRound size={15} /></span><b>Sign in</b><ChevronDown size={15} /></button>}
@@ -3237,22 +4410,19 @@ export default function App() {
       <div className="app-body">
         <aside className="sidebar">
           <span className="sidebar-caption">WORKSPACE</span>
-          <nav>          {navItems.slice(0, 7).map(({ name: itemName, label, icon: Icon }) => (
-            <button className={page === itemName ? 'active' : ''} key={itemName} onClick={() => { setPage(itemName); if (itemName === 'AI Documents') setChatOpen(false); }}><Icon size={18} /><span>{label}</span></button>
+          <nav>          {navItems.slice(0, 8).map(({ name: itemName, label, icon: Icon }) => (
+            <button className={page === itemName || (itemName === 'Settings' && settingsPages.includes(page)) ? 'active' : ''} key={itemName} onClick={() => { setPage(itemName); if (itemName === 'AI Documents') setChatOpen(false); }}><Icon size={18} /><span>{label}</span></button>
           ))}</nav>
-          {page !== 'AI Documents' && <section className="sidebar-assistant">
-              <span className="sidebar-companion">{companion.emoji}</span>
-              <b>Need a hand?</b>
-              <small>Ask the Vertex assistant</small>
-              <button onClick={() => setChatOpen(true)}>Open assistant</button>
-            </section>}
-          <nav className="sidebar-bottom">{navItems.slice(7).map(({ name: itemName, label, icon: Icon }) => (
+          {token && adminAccess === 'allowed' && <nav className="admin-sidebar-nav" aria-label="Administration">
+            <button className={page === 'Admin Dashboard' ? 'active' : ''} onClick={() => setPage('Admin Dashboard')}><ShieldCheck size={18} /><span>Admin Dashboard</span></button>
+          </nav>}
+          <nav className="sidebar-bottom">{navItems.slice(8).map(({ name: itemName, label, icon: Icon }) => (
             <button className={page === itemName ? 'active' : ''} key={itemName} onClick={() => setPage(itemName)}><Icon size={18} /><span>{label}</span></button>
           ))}</nav>
         </aside>
         <main className="main-content">
           {renderPage()}
-          {notice && !['Account / Privacy', 'Companion & Themes'].includes(page) && <Notice message={notice} onClose={() => setNotice('')} />}
+          {notice && !settingsPages.includes(page) && <Notice message={notice} onClose={() => setNotice('')} />}
         </main>
       </div>
       {page !== 'AI Documents' && assistantToast && (
@@ -3264,49 +4434,20 @@ export default function App() {
       )}
       {page !== 'AI Documents' && <button className="assistant-fab" aria-label="Open Vertex Assistant" onClick={() => setChatOpen((open) => !open)}><span>{companion.emoji}</span><small>AI</small></button>}
       {page !== 'AI Documents' && chatOpen && (
-        <section className="assistant-panel">
-          <header className="assistant-header">
-            <span className="assistant-star"><Sparkles size={17} /></span>
-            <span><b>Vertex Assistant</b><small>{chatConversations.find((item) => item.id === activeChatId)?.title || 'Private chat'} · {companion.name}</small></span>
-            <button className="assistant-new-chat" disabled={!token || chatHistoryBusy} onClick={() => void createChatConversation().catch((error: unknown) => setNotice(error instanceof Error ? error.message : 'Could not start a new chat.'))}><FilePlus2 size={15} /> New chat</button>
-            <button className="icon-button" aria-label="Close assistant" onClick={() => setChatOpen(false)}><X size={18} /></button>
-          </header>
-          <div className="assistant-workspace">
-            <aside className="assistant-history">
-              <b>Chat history</b>
-              {chatHistoryBusy && <small>Loading chats…</small>}
-              {!chatHistoryBusy && !chatConversations.length && <small>Your chats will appear here.</small>}
-              {chatConversations.map((conversation) => <div className={`assistant-history-item ${activeChatId === conversation.id ? 'active' : ''}`} key={conversation.id}>
-                <button title={conversation.title} onClick={() => void selectChatConversation(conversation.id)}>{conversation.title}</button>
-                <button aria-label={`Delete ${conversation.title}`} title="Delete chat" onClick={() => void deleteChatConversation(conversation.id)}><Trash2 size={13} /></button>
-              </div>)}
-              {!token && <small>Sign in to keep private chat history.</small>}
-            </aside>
-            <div className="assistant-chat-main">
-              <div className="assistant-messages">
-                {!chatMessages.length && <div className="assistant-welcome"><b>{companion.emoji} {companion.name}</b><p>Hello! Ask a question, attach a document or image, or convert a supported file.</p><button className="chat-speak-button" onClick={() => speakText('Hello! I am your Vertex assistant. Ask a question, attach a document or image, or convert a supported file.')}><Volume2 size={14}/> Listen</button>{!token && <small>Sign in to chat. Add an LLM_API_KEY to backend/.env to enable AI replies.</small>}</div>}
-                {chatMessages.map((message, index) => <div className={`chat-message-row ${message.role}`} key={`${message.role}-${index}`}><p className={`chat-message ${message.role}`}>{message.text}</p>{message.role==='assistant'&&<button className="chat-speak-button" aria-label="Read response aloud" onClick={() => speakText(message.text)}><Volume2 size={14}/></button>}</div>)}
-                {chatBusy && <p className="chat-message assistant">Thinking…</p>}
-                {voiceFeedback&&<small className="voice-feedback">{voiceFeedback}</small>}
-              </div>
-              {chatConversionOutput && <div className="assistant-conversion-result"><FileText size={16} /><span><b>{chatConversionOutput.file.name}</b><small>Conversion complete</small></span><a href={chatConversionOutput.url} download={chatConversionOutput.file.name}><Download size={15} /> Download</a></div>}
-            </div>
-          </div>
-          <div className="assistant-attachment-row">
-            <button onClick={() => chatAttachmentInputRef.current?.click()}><UploadCloud size={14} /> Attach file or image</button>
-            <input ref={chatAttachmentInputRef} type="file" accept=".pdf,.docx,.txt,.md,image/png,image/jpeg,image/webp" hidden onChange={(event) => { const file = event.target.files?.[0] ?? null; setChatAttachmentError(file && file.size > 50 * 1024 * 1024 ? 'Files must be 50 MB or smaller.' : ''); setChatAttachment(file && file.size <= 50 * 1024 * 1024 ? file : null); event.target.value = ''; }} />
-            {chatAttachment && <span className="assistant-attachment-chip" title={chatAttachment.name}>{chatAttachment.name}<button aria-label="Remove attachment" onClick={() => setChatAttachment(null)}><X size={12} /></button></span>}
-            <select aria-label="Convert attached file to" value={chatConversionFormat} onChange={(event) => setChatConversionFormat(event.target.value as ExportFormat)}><option value="pdf">Convert to PDF</option><option value="docx">Convert to DOCX</option><option value="txt">Convert to TXT</option></select>
-            <button disabled={!chatAttachment || chatConversionBusy || !token} onClick={() => void convertChatAttachment()}>{chatConversionBusy ? 'Converting…' : 'Convert'}</button>
-            {chatAttachmentError && <small role="alert">{chatAttachmentError}</small>}
-          </div>
-          <div className="assistant-compose">
-            <label className="language-select"><Languages size={15} /><select value={language} onChange={(event) => void savePreferences({ language: event.target.value })} aria-label="Assistant language">{languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}</select></label>
-            <textarea value={chatInput} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendChat(); } }} placeholder="Message Vertex Assistant…" aria-label="Message Vertex Assistant" />
-            <button className={`voice-button ${isListening?'voice-active':''}`} aria-label={isListening?'Stop voice input':'Speak your message'} aria-pressed={isListening} onClick={() => startVoiceInput((text) => setChatInput((current) => [current,text].filter(Boolean).join(' ')))}><Mic size={16}/></button>
-            <button className="send-button" aria-label="Send message" disabled={chatBusy || (!chatInput.trim() && !chatAttachment) || !token} onClick={() => void sendChat()}><Send size={17} /></button>
-          </div>
-        </section>
+        <VertexAssistant
+          api={API}
+          token={token}
+          companion={companion}
+          language={language}
+          languages={languages}
+          onLanguageChange={(lang) => void savePreferences({ language: lang })}
+          onClose={() => setChatOpen(false)}
+          speakText={speakText}
+          isListening={isListening}
+          startVoiceInput={startVoiceInput}
+          voiceFeedback={voiceFeedback}
+          setNotice={setNotice}
+        />
       )}
     </div>
   );
@@ -3316,11 +4457,11 @@ function TemplateArtwork({ template }: { template: TemplateKind }) {
   return (
     <span className={`template-card-art ${template}`} aria-hidden="true">
       <span className="template-mini-page">
-        {template==='resume'&&<><span className="template-mini-profile"><i/><span><b/><i/></span></span><i className="template-mini-rule"/><b className="template-mini-heading"/><i/><i/><b className="template-mini-heading"/><i/><i/></>}
-        {(template==='cover-letter'||template==='business-letter')&&<><b className="template-mini-heading"/><i/><i/><i className="template-mini-space"/><i/><i/><i/><i/></>}
-        {template==='meeting-notes'&&<><b className="template-mini-heading"/><i className="template-mini-date"/><b className="template-mini-heading"/><i/><i/><i className="template-mini-check"/><i className="template-mini-check"/></>}
-        {template==='project-proposal'&&<><span className="template-mini-banner"/><b className="template-mini-heading"/><i/><i/><b className="template-mini-heading"/><i/><i/></>}
-        {template==='invoice'&&<><span className="template-mini-invoice-head"><b/><i/></span><span className="template-mini-invoice-table"><b/><i/><i/><i/><i/><i/></span><i className="template-mini-total"/></>}
+        {template === 'resume' && <><span className="template-mini-profile"><i /><span><b /><i /></span></span><i className="template-mini-rule" /><b className="template-mini-heading" /><i /><i /><b className="template-mini-heading" /><i /><i /></>}
+        {(template === 'cover-letter' || template === 'business-letter') && <><b className="template-mini-heading" /><i /><i /><i className="template-mini-space" /><i /><i /><i /><i /></>}
+        {template === 'meeting-notes' && <><b className="template-mini-heading" /><i className="template-mini-date" /><b className="template-mini-heading" /><i /><i /><i className="template-mini-check" /><i className="template-mini-check" /></>}
+        {template === 'project-proposal' && <><span className="template-mini-banner" /><b className="template-mini-heading" /><i /><i /><b className="template-mini-heading" /><i /><i /></>}
+        {template === 'invoice' && <><span className="template-mini-invoice-head"><b /><i /></span><span className="template-mini-invoice-table"><b /><i /><i /><i /><i /><i /></span><i className="template-mini-total" /></>}
       </span>
     </span>
   );

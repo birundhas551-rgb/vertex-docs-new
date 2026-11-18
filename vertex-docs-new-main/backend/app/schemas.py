@@ -7,9 +7,15 @@ class SignupIn(BaseModel):
 class LoginIn(BaseModel):
     email:EmailStr
     password:str
+class SupabaseProfileIn(BaseModel):
+    name:str=Field(min_length=2,max_length=120)
 class UserOut(BaseModel):
     id:int; name:str; email:str; theme:str; language:str; avatar:str
     class Config: from_attributes=True
+class AuthOut(BaseModel):
+    access_token:str
+    token_type:Literal["bearer"]="bearer"
+    user:UserOut
 class PreferencesIn(BaseModel):
     theme:Literal[
         "forest-light","forest-dark","rose-light","rose-dark","graphite-light","graphite-dark",
@@ -46,6 +52,10 @@ class TranslationIn(BaseModel):
     text:str=Field(min_length=1,max_length=20000)
     source_language:Literal["auto","en","ta","hi","ml","te","kn","ja","de","sa","bn","fr","es","tanglish"]="auto"
     target_language:Literal["en","ta","hi","ml","te","kn","ja","de","sa","bn","fr","es","tanglish"]
+class HumanizeIn(BaseModel):
+    text:str=Field(min_length=1,max_length=20000)
+    writing_style:Literal["simple","professional","conversational","academic"]="simple"
+    strength:int=Field(default=3,ge=1,le=5)
 class TemplateRenderIn(BaseModel):
     template:Literal["resume","cover-letter","business-letter","meeting-notes","project-proposal","invoice"]
     layout:Literal["modern","classic","compact"]="modern"

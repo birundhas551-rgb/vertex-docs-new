@@ -10,6 +10,7 @@ TEST_DIRECTORY=Path(tempfile.mkdtemp(prefix="vertex-api-tests-"))
 os.environ["DATABASE_URL"]="sqlite:///"+(TEST_DIRECTORY/"test.db").as_posix()
 os.environ["SECRET_KEY"]="vertex-test-secret-key"
 os.environ["LLM_API_KEY"]=""
+os.environ["VERTEX_IGNORE_ENV_FILE"]="1"
 
 from fastapi.testclient import TestClient
 from app.main import app

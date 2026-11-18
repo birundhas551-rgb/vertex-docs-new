@@ -30,16 +30,25 @@ from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.platypus import Image as PdfImage,Paragraph,SimpleDocTemplate,Spacer
 from ..schemas import EditorExportIn
 from ..security import current_user
+from ..activity import record_activity
 from ..conversion_service import _image_to_pdf, convert_document
 from ..pdf_tool_service import parse_options, process_pdf_tool
 router=APIRouter(prefix="/api/pdf",tags=["PDF"])
 logger=logging.getLogger(__name__)
+
+def _log_pdf(u, action:str, metadata:dict|None=None, entity_id:int|None=None):
+    record_activity(u.id,f"pdf.{action}","pdf_operation",entity_id,metadata)
+
 def reader(data):
     try:return PdfReader(io.BytesIO(data))
     except Exception as e:raise HTTPException(400,f"Invalid PDF: {e}")
 @router.post("/info")
 async def info(file:UploadFile=File(...),u=Depends(current_user)):
-    r=reader(await file.read());return {"pages":len(r.pages),"metadata":{str(k):str(v) for k,v in (r.metadata or {}).items()}}
+    r=reader(await file.read())
+    page_count=len(r.pages)
+    result={"pages":page_count,"metadata":{str(k):str(v) for k,v in (r.metadata or {}).items()}}
+    _log_pdf(u,"info",{"page_count":page_count})
+    return result
 @router.post("/merge")
 async def merge(files:list[UploadFile]=File(...),u=Depends(current_user)):
     if len(files)<2:raise HTTPException(400,"Upload at least two PDFs")
@@ -47,6 +56,7 @@ async def merge(files:list[UploadFile]=File(...),u=Depends(current_user)):
     for f in files:
         for p in reader(await f.read()).pages:w.add_page(p)
     b=io.BytesIO();w.write(b);b.seek(0)
+    _log_pdf(u,"merge",{"input_file_count":len(files),"output_page_count":len(w.pages)})
     return StreamingResponse(b,media_type="application/pdf",headers={"Content-Disposition":'attachment; filename="vertex-merged.pdf"'})
 @router.post("/split")
 async def split(file:UploadFile=File(...),pages:str=Form(...),u=Depends(current_user)):
@@ -58,6 +68,7 @@ async def split(file:UploadFile=File(...),pages:str=Form(...),u=Depends(current_
             w.add_page(r.pages[i])
     except ValueError:raise HTTPException(400,"Use valid comma-separated page numbers, starting at 1")
     b=io.BytesIO();w.write(b);b.seek(0)
+    _log_pdf(u,"split",{"output_page_count":len(w.pages)})
     return StreamingResponse(b,media_type="application/pdf",headers={"Content-Disposition":'attachment; filename="vertex-pages.pdf"'})
 @router.post("/rotate")
 async def rotate(file:UploadFile=File(...),degrees:int=Form(90),u=Depends(current_user)):
@@ -65,6 +76,7 @@ async def rotate(file:UploadFile=File(...),degrees:int=Form(90),u=Depends(curren
     r=reader(await file.read());w=PdfWriter()
     for p in r.pages:p.rotate(degrees);w.add_page(p)
     b=io.BytesIO();w.write(b);b.seek(0)
+    _log_pdf(u,"rotate",{"page_count":len(r.pages),"rotation_degrees":degrees})
     return StreamingResponse(b,media_type="application/pdf",headers={"Content-Disposition":'attachment; filename="vertex-rotated.pdf"'})
 
 def pages_to_writer(data:bytes,pages:str,exclude:bool=False):
@@ -93,12 +105,16 @@ def pdf_response(writer:PdfWriter,filename:str):
 @router.post("/remove-pages")
 async def remove_pages(file:UploadFile=File(...),pages:str=Form(...),u=Depends(current_user)):
     writer=pages_to_writer(await file.read(),pages,exclude=True)
-    return pdf_response(writer,"vertex-pages-removed.pdf")
+    response=pdf_response(writer,"vertex-pages-removed.pdf")
+    _log_pdf(u,"remove_pages",{"output_page_count":len(writer.pages)})
+    return response
 
 @router.post("/extract-pages")
 async def extract_pages(file:UploadFile=File(...),pages:str=Form(...),u=Depends(current_user)):
     writer=pages_to_writer(await file.read(),pages)
-    return pdf_response(writer,"vertex-pages-extracted.pdf")
+    response=pdf_response(writer,"vertex-pages-extracted.pdf")
+    _log_pdf(u,"extract_pages",{"output_page_count":len(writer.pages)})
+    return response
 
 @router.post("/organize")
 async def organize_pdf(
@@ -137,7 +153,9 @@ async def organize_pdf(
         if degrees:
             page.rotate(degrees)
         writer.add_page(page)
-    return pdf_response(writer, "vertex-organized.pdf")
+    response=pdf_response(writer, "vertex-organized.pdf")
+    _log_pdf(u,"organize",{"output_page_count":len(order),"rotated_page_count":len(rotation_map)})
+    return response
 
 @router.post("/protect")
 async def protect(file:UploadFile=File(...),password:str=Form(...),u=Depends(current_user)):
@@ -145,7 +163,9 @@ async def protect(file:UploadFile=File(...),password:str=Form(...),u=Depends(cur
         raise HTTPException(400,"Password must contain 1 to 128 characters")
     writer=PdfWriter(clone_from=io.BytesIO(await file.read()))
     writer.encrypt(password)
-    return pdf_response(writer,"vertex-protected.pdf")
+    response=pdf_response(writer,"vertex-protected.pdf")
+    _log_pdf(u,"protect",{"page_count":len(writer.pages)})
+    return response
 
 @router.post("/unlock")
 async def unlock(file:UploadFile=File(...),password:str=Form(...),u=Depends(current_user)):
@@ -160,12 +180,16 @@ async def unlock(file:UploadFile=File(...),password:str=Form(...),u=Depends(curr
     writer=PdfWriter()
     for page in source.pages:
         writer.add_page(page)
-    return pdf_response(writer,"vertex-unlocked.pdf")
+    response=pdf_response(writer,"vertex-unlocked.pdf")
+    _log_pdf(u,"unlock",{"page_count":len(writer.pages)})
+    return response
 
 @router.post("/text")
 async def extract_text(file:UploadFile=File(...),u=Depends(current_user)):
     source=reader(await file.read())
-    return {"text":"\n\n".join(page.extract_text() or "" for page in source.pages)}
+    result={"text":"\n\n".join(page.extract_text() or "" for page in source.pages)}
+    _log_pdf(u,"text_extract",{"page_count":len(source.pages)})
+    return result
 
 def _optimized_pdf(data: bytes, dpi_threshold: int, dpi_target: int, quality: int) -> bytes:
     document = pymupdf.open(stream=data, filetype="pdf")
@@ -274,6 +298,7 @@ async def compress(
     }
     if target_size_bytes is not None:
         headers["X-Compression-Target-Bytes"] = str(target_size_bytes)
+    _log_pdf(u,"compress",{"compression_mode":mode,"input_size_bytes":len(data),"output_size_bytes":len(output)})
     return StreamingResponse(
         io.BytesIO(output),
         media_type="application/pdf",
@@ -293,7 +318,9 @@ async def preview_page(file:UploadFile=File(...),page:int=Form(1),u=Depends(curr
         pixmap=pdf_page.get_pixmap(matrix=pymupdf.Matrix(1.35,1.35),alpha=False)
         image_data=base64.b64encode(pixmap.tobytes("png")).decode("ascii")
         result={"page_number":page,"page_count":document.page_count,"width":pixmap.width,"height":pixmap.height,"image_data":image_data}
+        page_count=document.page_count
         document.close()
+        _log_pdf(u,"preview",{"page_number":page,"page_count":page_count})
         return result
     except HTTPException:
         raise
@@ -327,11 +354,13 @@ async def annotate_page(
         pdf_page=document.load_page(page-1)
         pdf_page.insert_image(pdf_page.rect,stream=overlay,overlay=True)
         output=document.tobytes(garbage=4,deflate=True)
+        page_count=document.page_count
         document.close()
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(400,"The annotations could not be applied to this PDF") from error
+    _log_pdf(u,"annotate",{"page_number":page,"page_count":page_count,"output_size_bytes":len(output)})
     return StreamingResponse(io.BytesIO(output),media_type="application/pdf",headers={"Content-Disposition":'attachment; filename="vertex-edited.pdf"'})
 
 def editor_image(image_data:str|None):
@@ -361,6 +390,7 @@ def export_editor(x:EditorExportIn,u=Depends(current_user)):
         if image or drawing:
             raise HTTPException(400,"Plain text cannot include images or marks. Choose PDF or DOCX to keep them.")
         data=x.content.encode("utf-8")
+        _log_pdf(u,"editor_export",{"output_format":"txt","page_size":x.page_size,"output_size_bytes":len(data)})
         return StreamingResponse(
             io.BytesIO(data),
             media_type="text/plain; charset=utf-8",
@@ -379,6 +409,7 @@ def export_editor(x:EditorExportIn,u=Depends(current_user)):
         output=io.BytesIO()
         document.save(output)
         output.seek(0)
+        _log_pdf(u,"editor_export",{"output_format":"docx","page_size":x.page_size,"output_size_bytes":output.getbuffer().nbytes})
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -393,6 +424,7 @@ def export_editor(x:EditorExportIn,u=Depends(current_user)):
         document.showPage()
         document.save()
         output.seek(0)
+        _log_pdf(u,"editor_export",{"output_format":"pdf","page_size":x.page_size,"output_size_bytes":output.getbuffer().nbytes})
         return StreamingResponse(output,media_type="application/pdf",headers={"Content-Disposition":'attachment; filename="vertex-document.pdf"'})
     margin=18*mm
     output=io.BytesIO()
@@ -429,6 +461,7 @@ def export_editor(x:EditorExportIn,u=Depends(current_user)):
             "This PDF font cannot render one or more characters. Export as DOCX or TXT to preserve all languages.",
         ) from error
     output.seek(0)
+    _log_pdf(u,"editor_export",{"output_format":"pdf","page_size":x.page_size,"output_size_bytes":output.getbuffer().nbytes})
     return StreamingResponse(
         output,
         media_type="application/pdf",
@@ -441,6 +474,7 @@ async def convert_file(file:UploadFile=File(...),output_format:str=Form(...),u=D
     if len(content)>50*1024*1024:
         raise HTTPException(413,"Files must be 50 MB or smaller")
     output,media_type,filename=convert_document(content,file.filename or "document",output_format)
+    _log_pdf(u,"convert",{"output_format":output_format,"input_size_bytes":len(content),"output_size_bytes":len(output)})
     return StreamingResponse(
         io.BytesIO(output),
         media_type=media_type,
@@ -481,6 +515,7 @@ async def scan_to_pdf(
     writer.write(output)
     if output.tell() > 100 * 1024 * 1024:
         raise HTTPException(413, "The scanned PDF exceeds the 100 MB output limit.")
+    _log_pdf(u,"scan",{"input_file_count":len(files),"output_page_count":len(writer.pages),"output_size_bytes":output.tell()})
     output.seek(0)
     return StreamingResponse(
         output,
@@ -506,9 +541,12 @@ async def apply_pdf_tool(
             raise HTTPException(413, "Files must be 50 MB or smaller")
         additional_files.append((additional.filename or "attachment", data))
     result = process_pdf_tool(tool, content, additional_files, parse_options(options))
+    input_file_count=1+len(additional_files)
     if isinstance(result, dict):
+        _log_pdf(u,"tool",{"tool":tool,"input_file_count":input_file_count})
         return result
     content, media_type, filename = result
+    _log_pdf(u,"tool",{"tool":tool,"input_file_count":input_file_count,"output_size_bytes":len(content)})
     return StreamingResponse(
         io.BytesIO(content),
         media_type=media_type,

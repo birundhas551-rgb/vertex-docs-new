@@ -39,7 +39,14 @@ class TemplatesAndAiTests(ApiTestCase):
         self.assertEqual(uploaded.status_code,200,uploaded.text)
         document_id=uploaded.json()["id"]
         summary=self.client.post(f"/api/ai/documents/{document_id}/summarize",headers=auth,json={"language":"tanglish"})
-        self.assertEqual(summary.status_code,503,summary.text)
+        self.assertEqual(summary.status_code,200,summary.text)
+        self.assertIn("Launch date",summary.json()["summary"])
+        chat=self.client.post(
+            f"/api/ai/documents/{document_id}/chat",
+            headers=auth,
+            json={"message":"When is the launch?","language":"en"},
+        )
+        self.assertEqual(chat.status_code,503,chat.text)
         self.client.delete(f"/api/documents/{document_id}",headers=auth)
 
     def test_long_file_translation_uses_parallel_ordered_sections(self):
@@ -72,6 +79,8 @@ class TemplatesAndAiTests(ApiTestCase):
             response.json()["translation"],
             "\n\n".join(f"Translated Section {index}" for index in range(5)),
         )
+        self.assertEqual(response.json()["original_text"], text.strip())
+        self.assertEqual(response.json()["detected_source_language"], "en")
 
     def test_ai_question_generator_uses_document_text_and_validates_count(self):
         _,token=self.create_account()
@@ -95,3 +104,66 @@ class TemplatesAndAiTests(ApiTestCase):
             files={"file":("brief.txt",b"The launch date is Friday.","text/plain")},
         )
         self.assertEqual(invalid.status_code,400,invalid.text)
+
+    def test_summary_uses_the_documents_own_language(self):
+        _,token=self.create_account()
+        auth={"Authorization":f"Bearer {token}"}
+        cases=[
+            ("tamil.txt","தமிழ் மொழியில் எழுதப்பட்ட ஆவணம். இது ஒரு சிறிய சோதனை. இந்த ஆவணம் மூன்று வாக்கியங்களைக் கொண்டுள்ளது.","ta","en",range(0x0B80,0x0C00)),
+            ("hindi.txt","यह हिन्दी भाषा में लिखा गया दस्तावेज़ है। यह एक परीक्षण है। इस दस्तावेज़ में तीन वाक्य हैं।","hi","en",range(0x0900,0x0980)),
+            ("english.txt","This document is written in English. It is a short test. The summary should stay in English.","en","ta",None),
+        ]
+        for filename,text,language_code,requested,script_range in cases:
+            with self.subTest(filename=filename):
+                uploaded=self.client.post(
+                    "/api/documents/upload",
+                    headers=auth,
+                    files={"file":(filename,text.encode("utf-8"),"text/plain")},
+                )
+                self.assertEqual(uploaded.status_code,200,uploaded.text)
+                document_id=uploaded.json()["id"]
+                response=self.client.post(
+                    f"/api/ai/documents/{document_id}/summarize",
+                    headers=auth,
+                    json={"language":requested},
+                )
+                self.assertEqual(response.status_code,200,response.text)
+                body=response.json()
+                self.assertEqual(body["language"],language_code)
+                self.assertEqual(body["detected_language"],language_code)
+                self.assertFalse(body["fallback_used"])
+                self.assertTrue(body["summary"].strip())
+                self.assertLessEqual(len(body["summary"]),len(text))
+                if script_range:
+                    self.assertTrue(
+                        any(ord(character) in script_range for character in body["summary"]),
+                        body["summary"],
+                    )
+                else:
+                    self.assertFalse(any(ord(character)>=0x0900 for character in body["summary"]))
+                self.client.delete(f"/api/documents/{document_id}",headers=auth)
+
+    def test_summary_works_offline_and_trims_long_documents(self):
+        _,token=self.create_account()
+        auth={"Authorization":f"Bearer {token}"}
+        sentences=[f"Key point {index}: the project budget is {index*100} dollars." for index in range(1,40)]
+        text=" ".join(sentences)
+        uploaded=self.client.post(
+            "/api/documents/upload",
+            headers=auth,
+            files={"file":("long.txt",text.encode("utf-8"),"text/plain")},
+        )
+        self.assertEqual(uploaded.status_code,200,uploaded.text)
+        document_id=uploaded.json()["id"]
+        response=self.client.post(
+            f"/api/ai/documents/{document_id}/summarize",
+            headers=auth,
+            json={"language":"en"},
+        )
+        self.assertEqual(response.status_code,200,response.text)
+        summary=response.json()["summary"]
+        self.assertLess(len(summary),len(text))
+        self.assertGreater(len(summary),200)
+        self.assertIn("Key point",summary)
+        self.client.delete(f"/api/documents/{document_id}",headers=auth)
+
