@@ -16,12 +16,14 @@ CACHE_SECONDS = 600
 
 
 def _provider_state() -> tuple[bool, str, str]:
+    provider = llm_setting("LLM_PROVIDER", "").lower()
     key = llm_setting("LLM_API_KEY")
-    base = llm_setting("LLM_BASE_URL", "https://api.openai.com/v1")
-    if not key:
-        ollama_base = llm_setting("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-        ollama_model = llm_setting("OLLAMA_MODEL", "llama3.2")
+    is_ollama = provider == "ollama" or not key or key.lower() == "ollama"
+    if is_ollama:
+        ollama_base = llm_setting("OLLAMA_BASE_URL") or llm_setting("LLM_BASE_URL", "http://127.0.0.1:11434")
+        ollama_model = llm_setting("OLLAMA_MODEL") or llm_setting("LLM_MODEL", "llama3.2")
         return True, ollama_model, ollama_base
+    base = llm_setting("LLM_BASE_URL", "https://api.openai.com/v1")
     return True, ",".join(llm_models()), base
 
 

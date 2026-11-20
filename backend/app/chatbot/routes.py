@@ -330,15 +330,22 @@ async def send_chat_message(
             raise
 
     # 4. LLM Completion with Server-Side Function Calling
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
     key = os.getenv("LLM_API_KEY", "").strip()
-    if key:
+    is_ollama = provider == "ollama" or not key or key.lower() == "ollama"
+
+    if is_ollama:
+        ollama_raw = os.getenv("OLLAMA_BASE_URL") or os.getenv("LLM_BASE_URL", "http://127.0.0.1:11434")
+        ollama_raw = ollama_raw.strip().rstrip("/")
+        if ollama_raw.endswith("/v1"):
+            base = ollama_raw
+        else:
+            base = f"{ollama_raw}/v1"
+        model = (os.getenv("OLLAMA_MODEL") or os.getenv("LLM_MODEL", "llama3.2")).split(",")[0].strip()
+        key = "ollama"
+    else:
         base = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
         model = os.getenv("LLM_MODEL", "gpt-4o-mini").split(",")[0].strip()
-    else:
-        # Ollama exposes an OpenAI-compatible chat endpoint locally.
-        base = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-        model = os.getenv("OLLAMA_MODEL", "llama3.2")
-        key = "ollama"
 
     system_instruction = build_system_prompt(payload.language)
     msgs: list[dict[str, Any]] = [{"role": "system", "content": system_instruction}]

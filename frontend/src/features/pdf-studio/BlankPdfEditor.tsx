@@ -120,6 +120,28 @@ export default function BlankPdfEditor({ onClose }: { onClose?: () => void }) {
     }
   }
 
+  function applyListStyle(type: string) {
+    setListStyle(type);
+    restoreSelection();
+    document.execCommand('insertOrderedList');
+    const sel = window.getSelection();
+    if (sel && sel.anchorNode) {
+      const el = sel.anchorNode instanceof HTMLElement ? sel.anchorNode : sel.anchorNode.parentElement;
+      const ol = el?.closest('ol');
+      if (ol) {
+        ol.style.listStyleType = type;
+      }
+    }
+    editorRef.current?.focus();
+  }
+
+  function placeCaretAtPoint(e: React.MouseEvent) {
+    if (e.target === editorRef.current || editorRef.current?.contains(e.target as Node)) {
+      return;
+    }
+    editorRef.current?.focus();
+  }
+
   function handlePaste(e: React.ClipboardEvent) {
     e.preventDefault();
     const html = e.clipboardData.getData('text/html');

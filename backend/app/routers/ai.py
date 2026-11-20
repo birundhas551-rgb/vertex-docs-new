@@ -313,7 +313,11 @@ def env_file_values() -> dict[str, str]:
 
 
 def llm_setting(name: str, default: str = "") -> str:
-    return env_file_values().get(name) or os.getenv(name, default).strip() or default
+    # OS environment variable takes priority (essential for cloud platforms like Render)
+    val = os.getenv(name)
+    if val is not None and val.strip():
+        return val.strip()
+    return env_file_values().get(name) or default
 
 
 def provider_error_detail(response: httpx.Response, model: str) -> str:
@@ -346,16 +350,23 @@ def llm_models() -> list[str]:
 
 
 async def ai_completion(messages: list[dict], max_tokens: int | None = None) -> str:
+    provider = llm_setting("LLM_PROVIDER", "").lower()
     key = llm_setting("LLM_API_KEY")
-    # Prefer a configured cloud-compatible provider. If no API key is present,
-    # use the locally installed Ollama service (OpenAI-compatible endpoint).
-    if not key:
-        ollama_base = llm_setting("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-        ollama_model = llm_setting("OLLAMA_MODEL", "llama3.2")
+    is_ollama = provider == "ollama" or not key or key.lower() == "ollama"
+
+    # Use local/tunneled Ollama service (OpenAI-compatible endpoint)
+    if is_ollama:
+        ollama_raw = llm_setting("OLLAMA_BASE_URL") or llm_setting("LLM_BASE_URL", "http://127.0.0.1:11434")
+        ollama_raw = ollama_raw.strip().rstrip("/")
+        if ollama_raw.endswith("/v1"):
+            ollama_base = ollama_raw[:-3].rstrip("/")
+        else:
+            ollama_base = ollama_raw
+        ollama_model = llm_setting("OLLAMA_MODEL") or llm_setting("LLM_MODEL", "llama3.2")
         try:
             async with httpx.AsyncClient(timeout=180) as client:
                 response = await client.post(
-                    ollama_base + "/v1/chat/completions",
+                    f"{ollama_base}/v1/chat/completions",
                     headers={"Authorization": "Bearer ollama"},
                     json={"model": ollama_model, "messages": messages, "stream": False, **({"max_tokens": max_tokens} if max_tokens is not None else {})},
                 )
@@ -371,7 +382,7 @@ async def ai_completion(messages: list[dict], max_tokens: int | None = None) -> 
         except httpx.RequestError as error:
             raise HTTPException(
                 503,
-                f"AI is not reachable. Start Ollama and pull '{ollama_model}', or configure LLM_API_KEY in backend/.env."
+                f"AI is not reachable. Ensure Ollama is running and accessible at '{ollama_base}' with model '{ollama_model}'."
             ) from error
     base = llm_setting("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     models = llm_models()
